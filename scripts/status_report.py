@@ -97,6 +97,32 @@ def main():
         catalog = json.loads(config.catalog_file.read_text())
         print(f"\nCatalog: {len(catalog)} entries")
 
+    # Fetch stats
+    if config.fetch_stats_file.exists():
+        stats = json.loads(config.fetch_stats_file.read_text())
+        print(f"\nFetch Stats:")
+        print(f"  Wall time: {stats.get('wall_time_seconds', 0):.1f}s "
+              f"(fetch: {stats.get('fetch_wall_time_seconds', 0):.1f}s, "
+              f"extraction: {stats.get('extraction_wall_time_seconds', 0):.1f}s)")
+        print(f"  Total: {stats.get('total_success', 0)} success, "
+              f"{stats.get('total_failure', 0)} failure")
+
+        by_method = stats.get("by_method", {})
+        if by_method.get("success"):
+            print(f"  By method (success):")
+            for method, count in by_method["success"].items():
+                print(f"    {method}: {count}")
+        if by_method.get("failure"):
+            print(f"  By method (failure):")
+            for method, count in by_method["failure"].items():
+                print(f"    {method}: {count}")
+
+        cb = stats.get("circuit_breaker", {})
+        if cb.get("domains_tripped"):
+            print(f"  Circuit breaker: {cb['domains_tripped']} domains tripped")
+            for d in cb.get("tripped_domains", []):
+                print(f"    {d}")
+
     # Checkpoints
     print(f"\nCheckpoints:")
     for stage in ["index", "fetch", "match", "download", "normalize"]:

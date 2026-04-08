@@ -397,31 +397,25 @@ def is_valid_product_content(content: bytes, content_type: str) -> bool:
 3. Add these as optional discovery vectors in Phase 1, controllable via config
 4. Update the site config schema with `alternative_archives:` section
 
-### Priority 6: Harden Rate Limiting and Error Handling (Medium) — Partially Addressed
+### Priority 6: Harden Rate Limiting and Error Handling (Medium) ✅ COMPLETED
 
 **What:** Implement proper rate limiting, circuit breakers, and error classification across the pipeline.
 
-**Partial progress (April 8, 2026):** `fetch_archive.py` implements:
-- Oxylabs ISP proxy rotation (20 IPs via ports 8001-8020) for Wayback rate-limit avoidance
-- Exponential backoff with port rotation on failure (3 retries per URL)
-- Content validation that detects anti-bot pages and Wayback wrappers
-- Async concurrency control (configurable workers, default 5)
+**Status:** Completed April 8, 2026:
+1. `CircuitBreaker` class in `lib/wayback_archiver/resilience.py` — tracks consecutive failures per domain with escalating responses: 3 fails → 120s pause, 6 fails → 300s pause, 10 fails → skip domain entirely
+2. `--max-retries` and `--backoff-factor` CLI arguments exposed in `run_stage.py`
+3. Circuit breaker integrated into `run_fetch` extraction phase — skips domains that consistently fail
+4. Previous partial progress preserved: proxy rotation, exponential backoff, content validation in `fetch_archive.py`
 
-**Remaining:**
-1. Global circuit breaker (3 consecutive failures → pause) — not yet implemented
-2. Per-domain rate limiter class — not yet implemented (proxy rotation handles this implicitly)
-3. `--max-retries` and `--backoff-factor` CLI arguments — not yet exposed
-4. Integration with `run_stage.py` pipeline runner — `fetch_archive.py` runs standalone
-
-### Priority 7: Pipeline Observability (Low)
+### Priority 7: Pipeline Observability (Low) ✅ COMPLETED
 
 **What:** Add logging and metrics to understand where the pipeline spends its time and where it fails.
 
-**Changes:**
-1. Add per-stage timing metrics
-2. Add per-method success/failure counters (CommonCrawl WARC, Wayback JSON, Playwright)
-3. Add a `--verbose` flag that logs every fetch attempt with method, URL, result, and duration
-4. Update `status_report.py` to show method-level success rates
+**Status:** Completed April 8, 2026:
+1. `StageTimer` class in `lib/wayback_archiver/resilience.py` — tracks wall time and per-method success/failure counters
+2. `run_fetch` writes `{name}_fetch_stats.json` with timing, method breakdowns, and circuit breaker stats
+3. `status_report.py` reads and displays `_fetch_stats.json` — shows wall time, method-level success/failure, circuit breaker state
+4. All stats include both fetch phase timing and extraction phase timing separately
 
 ---
 

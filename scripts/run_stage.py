@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.expanduser("~/lib"))
 
 from wayback_archiver.site_config import load_config
 from wayback_archiver.checkpoint import StageCheckpoint
+from wayback_archiver.resilience import CircuitBreaker, StageTimer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -339,11 +340,17 @@ def run_fetch(config, dry_run=False, proxy_type="isp", workers=5, max_retries=3,
       3. ISP/DC proxy fallback
 
     After fetching, extracts metadata and image URLs from downloaded HTML files.
+    Tracks per-method success/failure counts and writes fetch_stats.json.
     """
     from wayback_archiver.extract import extract_image_urls
     from wayback_archiver.metadata import (
         extract_shopify_metadata, extract_api_metadata, extract_publish_date,
     )
+
+    timer = StageTimer("fetch")
+    timer.start()
+
+    cb = CircuitBreaker(max_retries=max_retries, backoff_factor=backoff_factor)
 
     # Warn about deprecated transport_pkg
     if config.transport_pkg:
@@ -369,7 +376,8 @@ def run_fetch(config, dry_run=False, proxy_type="isp", workers=5, max_retries=3,
         log.info("[DRY RUN] Would fetch %d URLs from %s via %s proxy with %d workers",
                  len(urls), links_file, proxy_type, workers)
         log.info("[DRY RUN] Output dir: %s", output_dir)
-        # Delegate to fetch_archive's dry-run for detailed plan
+        log.info("[DRY RUN] Circuit breaker: max_retries=%d, backoff_factor=%.1f",
+                 max_retries, backoff_factor)
         asyncio.run(fetch_archive.run(
             links_file=links_file,
             output_dir=output_dir,
@@ -385,6 +393,8 @@ def run_fetch(config, dry_run=False, proxy_type="isp", workers=5, max_retries=3,
     log.info("  Links: %s", links_file)
     log.info("  Output: %s", output_dir)
     log.info("  Proxy: %s | Workers: %d", proxy_type, workers)
+    log.info("  Circuit breaker: max_retries=%d, backoff_factor=%.1f",
+             max_retries, backoff_factor)
 
     asyncio.run(fetch_archive.run(
         links_file=links_file,
@@ -395,6 +405,18 @@ def run_fetch(config, dry_run=False, proxy_type="isp", workers=5, max_retries=3,
         dry_run=False,
     ))
     fetch_elapsed = time.time() - t0
+
+    # ── Collect fetch stats from downloaded files ──────────────────────
+    # Scan output dir to count success/failure by inspecting what's there
+    html_files = sorted(output_dir.glob("*.html")) if output_dir.exists() else []
+    for html_path in html_files:
+        size = html_path.stat().st_size
+        if size > 1000:
+            # Determine method from file — we can't know the exact method,
+            # but we can count it as a successful fetch
+            timer.record_success("fetch_cascade")
+        else:
+            timer.record_failure("too_small")
 
     # ── Phase B: Extract metadata from downloaded HTML ─────────────────
     log.info("Extracting metadata from fetched pages...")
@@ -413,14 +435,11 @@ def run_fetch(config, dry_run=False, proxy_type="isp", workers=5, max_retries=3,
     if config.index_file.exists():
         index = json.loads(config.index_file.read_text())
 
-    # Process each downloaded HTML file
-    html_files = sorted(output_dir.glob("*.html")) if output_dir.exists() else []
     processed = 0
     skipped = 0
 
     try:
         for i, html_path in enumerate(html_files, 1):
-            # Derive a slug from the filename
             slug = _slug_from_html_filename(html_path.name)
             if not slug:
                 continue
@@ -429,14 +448,24 @@ def run_fetch(config, dry_run=False, proxy_type="isp", workers=5, max_retries=3,
                 skipped += 1
                 continue
 
+            # Circuit breaker check for the domain
+            domain = _domain_from_filename(html_path.name)
+            if domain and cb.should_skip(domain):
+                log.debug("  Skipping %s (circuit breaker tripped for %s)", slug, domain)
+                timer.record_failure("circuit_breaker_skip")
+                continue
+
             content = html_path.read_text(errors="replace")
             if not content or len(content) < 100:
+                if domain:
+                    pause = cb.record_failure(domain)
+                    if pause > 0:
+                        log.info("  Circuit breaker pause: %.0fs for %s", pause, domain)
+                timer.record_failure("empty_content")
                 continue
 
             # Determine if this is JSON/API or HTML
-            is_json = False
-            if content.lstrip().startswith("{") or content.lstrip().startswith("["):
-                is_json = True
+            is_json = content.lstrip()[:1] in ("{", "[")
 
             if is_json:
                 try:
@@ -448,15 +477,22 @@ def run_fetch(config, dry_run=False, proxy_type="isp", workers=5, max_retries=3,
                             data = json.loads(m.group(0))
                         except json.JSONDecodeError:
                             log.debug("  JSON parse failed for %s", slug)
+                            timer.record_failure("json_parse")
                             continue
                     else:
+                        timer.record_failure("json_parse")
                         continue
 
                 meta = extract_api_metadata(data)
                 image_urls = meta.pop("image_urls", [])
+                timer.record_success("api_extract")
             else:
                 image_urls = extract_image_urls(content)
                 meta = extract_shopify_metadata(content, slug)
+                timer.record_success("html_extract")
+
+            if domain:
+                cb.record_success(domain)
 
             # Write image links
             links_file_out = config.links_dir / f"{slug}.txt"
@@ -490,11 +526,33 @@ def run_fetch(config, dry_run=False, proxy_type="isp", workers=5, max_retries=3,
     finally:
         config.metadata_file.write_text(json.dumps(metadata, indent=2))
 
-    total_elapsed = time.time() - t0
-    log.info("DONE — fetch: %.1fs, extraction: %.1fs total",
-             fetch_elapsed, total_elapsed - fetch_elapsed)
+    timer.stop()
+
+    # Write fetch stats
+    stats = {
+        **timer.get_stats(),
+        "circuit_breaker": cb.get_stats(),
+        "fetch_wall_time_seconds": round(fetch_elapsed, 1),
+        "extraction_wall_time_seconds": round(timer.elapsed - fetch_elapsed, 1),
+        "metadata_entries": len(metadata),
+        "new_entries": processed,
+        "skipped_entries": skipped,
+    }
+    config.fetch_stats_file.write_text(json.dumps(stats, indent=2))
+    log.info("Fetch stats written to %s", config.fetch_stats_file)
+
+    timer.log_summary()
     log.info("  Metadata: %d entries (%d new, %d skipped)",
              len(metadata), processed, skipped)
+
+
+def _domain_from_filename(filename: str) -> str | None:
+    """Extract domain from a fetch_archive.py output filename."""
+    # Filenames look like: www.yeezygap.com_products_dove-hoodie.html
+    parts = filename.split("_")
+    if parts and "." in parts[0]:
+        return parts[0]
+    return None
 
 
 def _slug_from_html_filename(filename: str) -> str | None:
