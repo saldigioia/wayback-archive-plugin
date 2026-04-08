@@ -44,9 +44,10 @@ sys.path.insert(0, str(REPO_ROOT))
 
 
 def run_index(config, dry_run=False, **_kw):
-    """Stage 1: Parse CDX → product index."""
+    """Stage 1: Parse CDX → product index, then run CommonCrawl discovery."""
     from wayback_archiver.cdx import parse_cdx
 
+    products = {}
     for cdx_path in config.cdx_paths:
         log.info("Parsing CDX: %s", cdx_path)
         products = parse_cdx(
@@ -74,10 +75,174 @@ def run_index(config, dry_run=False, **_kw):
 
     if dry_run:
         log.info("[DRY RUN] Would write %d entries to %s", len(products), config.index_file)
+        log.info("[DRY RUN] Would also run CommonCrawl discovery for %d domains", len(config.domains))
         return
 
     config.index_file.write_text(json.dumps(products, indent=2, sort_keys=False))
     log.info("Written to %s", config.index_file)
+
+    # ── Pass 2: CommonCrawl discovery ──────────────────────────────────
+    log.info("")
+    log.info("Running CommonCrawl discovery...")
+    cc_results = asyncio.run(_cc_discovery(config))
+    if cc_results:
+        # Merge CC discoveries into the product index (dedup against existing)
+        before_count = len(products)
+        for handle, cc_info in cc_results.items():
+            if handle not in products:
+                products[handle] = {
+                    "slug": handle,
+                    "url_type": cc_info.get("url_type", "slug"),
+                    "era": cc_info.get("era", "unknown"),
+                    "original_url": cc_info["original_url"],
+                    "wayback_url": cc_info.get("wayback_url", ""),
+                    "source": "commoncrawl",
+                    "cc_warc": cc_info.get("warc_coords"),
+                }
+
+        new_count = len(products) - before_count
+        log.info("CC discovery added %d new handles (total: %d)", new_count, len(products))
+
+        # Rewrite the index with merged results
+        config.index_file.write_text(json.dumps(products, indent=2, sort_keys=False))
+
+    # Save CC index separately for fetch_archive.py to use
+    if cc_results:
+        config.cc_index_file.write_text(json.dumps(cc_results, indent=2))
+        log.info("CC index saved to %s", config.cc_index_file)
+
+
+async def _cc_discovery(config) -> dict:
+    """Query CommonCrawl indices for product pages across all configured domains.
+
+    Returns a dict of {handle: {original_url, url_type, warc_coords, crawl}} for
+    each discovered product URL not already in the local index.
+
+    Uses CC_CRAWLS from fetch_archive.py to avoid duplicating the crawl list.
+    Rate-limits to 1 req/s against the CC index API.
+    """
+    import aiohttp
+    from fetch_archive import CC_CRAWLS
+
+    # Path patterns to query — product pages, collections, and root paths
+    PATH_PATTERNS = [
+        "/products/*",
+        "/collections/*",
+        "/",
+    ]
+
+    results = {}
+    total_queries = 0
+    total_hits = 0
+
+    async with aiohttp.ClientSession() as session:
+        for domain in config.domains:
+            log.info("  CC discovery: %s", domain)
+
+            for pattern in PATH_PATTERNS:
+                query_url_prefix = f"https://{domain}{pattern}"
+
+                for crawl_id in CC_CRAWLS:
+                    api_url = (
+                        f"https://index.commoncrawl.org/{crawl_id}-index"
+                        f"?url={query_url_prefix}&output=json&limit=500"
+                    )
+
+                    try:
+                        async with session.get(
+                            api_url,
+                            timeout=aiohttp.ClientTimeout(total=30),
+                        ) as resp:
+                            total_queries += 1
+
+                            if resp.status != 200:
+                                log.debug("    CC %s %s: HTTP %d", crawl_id, pattern, resp.status)
+                                await asyncio.sleep(1.0)
+                                continue
+
+                            text = await resp.text()
+                            if not text.strip():
+                                await asyncio.sleep(1.0)
+                                continue
+
+                            # CC returns NDJSON — parse each line
+                            for line in text.strip().split("\n"):
+                                try:
+                                    record = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+
+                                if record.get("status") != "200":
+                                    continue
+
+                                original_url = record.get("url", "")
+                                handle = _extract_handle(original_url)
+                                if not handle:
+                                    continue
+
+                                # Determine URL type
+                                path = re.sub(r"https?://[^/]+", "", original_url).lower()
+                                if path.endswith(".oembed"):
+                                    url_type = "oembed"
+                                elif path.endswith(".atom"):
+                                    url_type = "atom_feed"
+                                elif path.endswith(".json"):
+                                    url_type = "json_api"
+                                elif "/collections/" in path:
+                                    url_type = "collection"
+                                elif "/products/" in path:
+                                    url_type = "slug"
+                                else:
+                                    url_type = "page"
+
+                                warc_coords = {
+                                    "filename": record.get("filename", ""),
+                                    "offset": int(record.get("offset", 0)),
+                                    "length": int(record.get("length", 0)),
+                                    "crawl": crawl_id,
+                                }
+
+                                # Dedup: keep the entry with the most recent timestamp
+                                existing = results.get(handle)
+                                ts = record.get("timestamp", "")
+                                if not existing or ts > existing.get("timestamp", ""):
+                                    results[handle] = {
+                                        "original_url": original_url,
+                                        "url_type": url_type,
+                                        "timestamp": ts,
+                                        "warc_coords": warc_coords,
+                                    }
+                                    total_hits += 1
+
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        log.debug("    CC error %s %s: %s", crawl_id, pattern, e)
+                    finally:
+                        # Rate limit: 1 req/s against CC index
+                        await asyncio.sleep(1.0)
+
+    log.info("  CC discovery: %d queries, %d unique handles found", total_queries, len(results))
+    return results
+
+
+def _extract_handle(url: str) -> str | None:
+    """Extract a product handle from a URL for dedup purposes."""
+    path = re.sub(r"https?://[^/]+", "", url).split("?")[0].rstrip("/")
+
+    # /products/{handle}
+    m = re.search(r"/products/([^/]+)", path)
+    if m:
+        handle = m.group(1)
+        # Strip extensions
+        for ext in (".json", ".atom", ".oembed", ".xml"):
+            handle = handle.removesuffix(ext)
+        return handle.lower()
+
+    # /collections/{name}
+    m = re.search(r"/collections/([^/]+)", path)
+    if m:
+        return f"collection:{m.group(1).lower()}"
+
+    return None
 
 
 def run_filter(config, dry_run=False, **_kw):

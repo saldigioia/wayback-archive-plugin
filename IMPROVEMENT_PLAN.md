@@ -44,9 +44,9 @@ The `run_stage.py` script has six stages: `index`, `fetch`, `match`, `download`,
 
 CommonCrawl is documented as a concept but never wired into the executable pipeline.
 
-### 1.3 The Discovery Phase (1B) Has No Implementation
+### 1.3 The Discovery Phase (1B) Has No Implementation — ✅ RESOLVED
 
-Phase 1B (CommonCrawl Index — Handle Discovery) is described in the SKILL.md but has no corresponding code path. The `run_index` function in `run_stage.py` only calls `parse_cdx()` on local CDX dump files. It never queries `index.commoncrawl.org` for WARC coordinates. This means the pipeline never discovers which pages have CommonCrawl captures, and therefore can never use those captures during extraction.
+Phase 1B (CommonCrawl Index — Handle Discovery) is described in the SKILL.md but had no corresponding code path. **Resolved April 8, 2026:** `run_index` in `run_stage.py` now runs CommonCrawl discovery as a second pass after local CDX parsing. Queries `index.commoncrawl.org` for `/products/*`, `/collections/*`, and root paths across all configured domains and all `CC_CRAWLS` indices. Results saved to `{name}_commoncrawl_index.json` with WARC coordinates, and merged into the product index (dedup against existing handles). Rate-limited to 1 req/s.
 
 ### 1.4 The Wayback Landscape Has Shifted Dramatically (2025-2026)
 
