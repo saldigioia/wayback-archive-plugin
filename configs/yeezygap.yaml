@@ -1,0 +1,46 @@
+name: gap
+display_name: "Yeezy Gap"
+credit_line: "Yeezy Gap"
+
+domains:
+  - yeezygap.com
+  - www.yeezygap.com
+
+cdx_files:
+  - /Users/salvatore/Downloads/gap/ye-products.txt
+
+project_dir: /Users/salvatore/Downloads/gap
+transport_pkg: /Users/salvatore/Downloads/wayback_cdx_v2
+cdn_tool: /Users/salvatore/downloads/cdn/app.sh
+
+# Stage 1: URL classification (Shopify only)
+url_rules:
+  - path_prefix: "/products/"
+    url_type: slug
+    require_status: "200"
+    require_ctype: "text/html"
+
+junk_patterns:
+  - '%22.*|%3[Cc].*|%3[Ee].*'
+
+# Stage 1: Era detection (single era)
+era_rules:
+  - condition: "default"
+    era: late_shopify
+
+type_priority:
+  - slug
+
+# Stage 2: CDN patterns (Shopify only)
+cdn_patterns:
+  - name: shopify
+    regex: 'https?://cdn\.shopify\.com/s/files/[^\s"''\\]+/products/[^\s"''\\]+'
+    size_strip: '_(?:\d+|\{width\})x(?:@\dx)?(?=\.\w+)'
+    named_size_strip: '_(?:grande|medium|small|large|compact|master|pico|icon|thumb)(?=\.\w+)'
+
+# Stage 4: Download cascade
+download_cascade:
+  - live_cdn
+  - direct_fetch
+  - wayback_cdx_best
+  - exhaustive
