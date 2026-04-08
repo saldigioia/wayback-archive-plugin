@@ -319,54 +319,60 @@ parse their HAR files for CDN URLs.
 5. Install Playwright: `playwright install chromium` (last-resort fallback only)
 6. Run stages in order with dry-run first
 
-### Orchestration flow
+### Orchestration flow (via run_stage.py)
+
+All stages run through `scripts/run_stage.py`:
+```bash
+python3 scripts/run_stage.py <stage> --config configs/site.yaml [--dry-run]
 ```
-Phase 0: VALIDATE
-  Check CDX file exists, tools installed, paths valid.
-  Verify filter_cdx.py and fetch_archive.py are available.
-  Confirm proxy credentials (ISP or DC) are set.
 
-Phase 1: DISCOVERY (run 4 vectors in parallel)
-  1A: Wayback CDX handles (paginated, all subdomains)
-  1B: CommonCrawl index handles (all relevant crawls)
-  1C: Collection/category page handles
-  1D: CDN image filename reverse-discovery
-  -> DEDUP against existing catalog -> new_handles.json
+Stages execute in order: `index → filter → fetch → match → download → normalize → build`
 
-═══ CDX FILTERING GATE ═══
-  python filter_cdx.py raw_cdx.txt > links.txt
-  Expect ~90-95% reduction. Verify zero product URLs lost.
-  Output sorted: structured (oEmbed/Atom/JSON) first, then HTML.
-  Review stderr stats before proceeding.
+```
+Stage: INDEX
+  python3 run_stage.py index --config configs/site.yaml
+  Parse CDX dump → product index JSON.
+  Also runs CommonCrawl discovery (queries index.commoncrawl.org).
 
-═══ VERIFICATION GATE ═══
-No queries hit result cap. All subdomains/crawls attempted.
-Handles deduplicated and classified. Show counts to user.
+Stage: FILTER
+  python3 run_stage.py filter --config configs/site.yaml
+  Run filter_cdx.py logic on CDX dumps → clean links.txt.
+  Six-layer filter: status, MIME, junk paths, static ext, variants, dedup.
+  Expect ~90-95% reduction. Output sorted: structured first, then HTML.
 
-Phase 2: EXTRACTION (use fetch_archive.py)
-  python fetch_archive.py links.txt --resume
-  The script handles the full cascade automatically:
+Stage: FETCH
+  python3 run_stage.py fetch --config configs/site.yaml [--proxy isp|dc] [--workers 5]
+  Fetch pages via fetch_archive.py's async cascade:
     All URLs: Direct Wayback id_ first (no proxy cost)
     ↓ fallback on rate-limit or failure:
     Structured: proxy fallback
     HTML/Collections: CommonCrawl WARC → proxy fallback
   Content validated post-fetch: anti-bot detection, wrapper rejection.
-  For SPA-era sites, also fetch API JSON endpoints directly (2D).
-  -> MATCH + DEDUP cross-source entries
+  Then extracts metadata + image URLs from downloaded HTML.
+
+Stage: MATCH
+  python3 run_stage.py match --config configs/site.yaml
+  Fuzzy-match slug products to SKU products. Dedup cross-source entries.
 
 ═══ USER CONFIRMATION GATE ═══
 Show metadata coverage + image URL counts. Ask before downloading.
 
-Phase 3: ASSET DOWNLOAD
-  Test CDN liveness -> download live URLs via app.sh
-  Dead CDNs -> Wayback im_ fallback
-  POST-VALIDATE: check magic bytes on all downloads
+Stage: DOWNLOAD
+  python3 run_stage.py download --config configs/site.yaml
+  Test CDN liveness → download live URLs via app.sh.
+  Dead CDNs → Wayback im_ fallback.
+  POST-VALIDATE: check magic bytes on all downloads.
 
-Phase 4: NORMALIZE + BUILD
-  Rename images, compile catalog JSON + CSVs + report
+Stage: NORMALIZE
+  python3 run_stage.py normalize --config configs/site.yaml
+  Rename images, write metadata.txt per product.
+
+Stage: BUILD
+  python3 run_stage.py build --config configs/site.yaml
+  Compile final catalog JSON + stats.
 
 GAP RECOVERY (if needed):
-  Re-run fetch_archive.py with --proxy dc (datacenter fallback)
+  Re-run fetch with --proxy dc (datacenter fallback)
   Playwright + network interception for CDN URL discovery
   HAR-based recovery for anti-bot blocked pages
 ```

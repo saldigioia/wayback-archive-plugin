@@ -363,16 +363,18 @@ def is_valid_product_content(content: bytes, content_type: str) -> bool:
 5. Async with resume support, dry-run mode, ISP/DC proxy selection
 6. Proxy rotation across Oxylabs ISP ports 8001-8020 (20 distinct residential IPs)
 
-### Priority 3: Integrate the `wayback` Python Library (High)
+### Priority 3: Integrate the `wayback` Python Library (High) ✅ COMPLETED (superseded)
 
 **What:** Replace the custom transport layer with `edgi-govdata-archiving/wayback` for built-in rate limiting, retry logic, and CDX pagination.
 
-**Changes:**
-1. Install the `wayback` library
-2. Replace `build_transport(AppConfig.from_env())` in `run_fetch()` with `wayback.WaybackClient()`
-3. Use `client.search()` for CDX queries (gets pagination for free)
-4. Use `client.get_memento()` for page fetching (gets rate limiting for free)
-5. Configure shared `RateLimit` instance across all pipeline stages
+**Status:** Superseded by direct integration of `fetch_archive.py` into `run_stage.py` (April 8, 2026):
+1. `run_stage.py` now imports and calls `fetch_archive.run()` directly — the old `build_transport()` layer is bypassed entirely
+2. New `run_filter` stage runs `filter_cdx.py` logic on CDX dumps before fetching
+3. `run_fetch` uses `fetch_archive.py`'s async cascade (direct → CC WARC → proxy) instead of the old transport
+4. `transport_pkg` config key marked deprecated — warns but doesn't crash if present
+5. Stage ordering updated: index → filter → fetch → match → download → normalize → build
+6. CLI now accepts `--proxy`, `--workers`, `--max-retries`, `--backoff-factor` flags
+7. Post-fetch metadata extraction reads downloaded HTML files and runs the existing extractors
 
 ### Priority 4: Implement URL Filtering Guardrails (High) ✅ COMPLETED
 
