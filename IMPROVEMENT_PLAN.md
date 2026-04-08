@@ -387,15 +387,18 @@ def is_valid_product_content(content: bytes, content_type: str) -> bool:
 4. Stats to stderr, clean URLs to stdout — integrates cleanly into the three-step workflow
 5. Post-fetch validation implemented in `fetch_archive.py`: anti-bot signature detection (Akamai, Cloudflare), Wayback wrapper rejection, size gating (<5KB HTML = wrapper)
 
-### Priority 5: Add Alternative Archive Sources (Medium)
+### Priority 5: Add Alternative Archive Sources (Medium) ✅ COMPLETED
 
 **What:** Add archive.today and Memento Time Travel as supplementary discovery and extraction sources.
 
-**Changes:**
-1. Add an `archive_today_discovery()` function that queries archive.today's timemap API
-2. Add a `memento_discovery()` function that queries Memento Time Travel for gap handles
-3. Add these as optional discovery vectors in Phase 1, controllable via config
-4. Update the site config schema with `alternative_archives:` section
+**Status:** Completed April 8, 2026:
+1. `archive_today_lookup()` in `lib/wayback_archiver/alt_archives.py` — queries `archive.ph/timemap/json/{url}`, returns list of snapshot URLs
+2. `memento_lookup()` — queries `timetravel.mementoweb.org/timemap/json/{url}`, returns cross-archive captures with archive name classification
+3. `fallback_fetch()` — orchestrates both as a cascade: archive.today first, then Memento (filtering out Wayback/CC since we already tried those)
+4. Wired into `run_fetch` via plugin/hook pattern: `--fallback-archives archive_today memento` CLI flag runs after primary cascade for failed URLs
+5. Also configurable via YAML: `alternative_archives: { enabled: true, sources: [archive_today, memento] }`
+6. `references/site-config-schema.md` updated with `alternative_archives:` section
+7. `configs/yeezygap.yaml` updated as example
 
 ### Priority 6: Harden Rate Limiting and Error Handling (Medium) ✅ COMPLETED
 

@@ -38,6 +38,13 @@ cdn_patterns:
     size_strip: '_(?:\d+|\{width\})x(?:@\dx)?(?=\.\w+)'
     named_size_strip: '_(?:grande|medium|small|large|compact|master|pico|icon|thumb)(?=\.\w+)'
 
+# Alternative archive fallbacks (tried after Wayback + CC cascade fails)
+alternative_archives:
+  enabled: true
+  sources:
+    - archive_today
+    - memento
+
 # Stage 4: Download cascade
 download_cascade:
   - live_cdn

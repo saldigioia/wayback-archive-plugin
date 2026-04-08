@@ -139,6 +139,32 @@ platforms:
   - fourthwall
 ```
 
+## Alternative Archives
+
+Configure fallback archive sources for URLs that fail the primary
+Wayback + CommonCrawl cascade. These are tried after the main fetch
+cascade is exhausted (Step 4, after proxy, before giving up).
+
+```yaml
+alternative_archives:
+  enabled: true
+  sources:
+    - archive_today    # archive.ph / archive.today — on-demand captures
+    - memento          # timetravel.mementoweb.org — cross-archive aggregator
+```
+
+Can also be enabled per-run via CLI:
+```bash
+python3 run_stage.py fetch --config configs/site.yaml --fallback-archives archive_today memento
+```
+
+When enabled, after the primary cascade completes, the pipeline:
+1. Identifies URLs that failed (no output file or file < 500 bytes)
+2. Queries archive.today's timemap for available captures
+3. Queries Memento Time Travel for cross-archive captures
+4. Fetches from the most recent snapshot found
+5. Records successes as `alt_archive` method in fetch_stats.json
+
 ## Junk Patterns
 
 The junk pattern filter rejects URLs matching these patterns. Common junk:

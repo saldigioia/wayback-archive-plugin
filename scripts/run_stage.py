@@ -25,6 +25,8 @@ import sys
 import time
 from pathlib import Path
 
+import aiohttp
+
 # Add library to path
 sys.path.insert(0, os.path.expanduser("~/lib"))
 
@@ -406,6 +408,13 @@ def run_fetch(config, dry_run=False, proxy_type="isp", workers=5, max_retries=3,
     ))
     fetch_elapsed = time.time() - t0
 
+    # ── Phase A.5: Fallback archives for failed URLs ───────────────────
+    fallback_archives = _kw.get("fallback_archives")
+    if fallback_archives:
+        asyncio.run(_run_fallback_archives(
+            links_file, output_dir, fallback_archives, timer,
+        ))
+
     # ── Collect fetch stats from downloaded files ──────────────────────
     # Scan output dir to count success/failure by inspecting what's there
     html_files = sorted(output_dir.glob("*.html")) if output_dir.exists() else []
@@ -544,6 +553,64 @@ def run_fetch(config, dry_run=False, proxy_type="isp", workers=5, max_retries=3,
     timer.log_summary()
     log.info("  Metadata: %d entries (%d new, %d skipped)",
              len(metadata), processed, skipped)
+
+
+async def _run_fallback_archives(
+    links_file: Path,
+    output_dir: Path,
+    fallback_archives: list[str],
+    timer: StageTimer,
+) -> None:
+    """Try alternative archives (archive.today, memento) for URLs that failed
+    the primary Wayback + CC cascade.
+
+    This is a plugin/hook that wraps fetch_archive.py without modifying it.
+    It reads the links file, checks which output files are missing or too small,
+    and queries alternative archives for those URLs.
+    """
+    from wayback_archiver.alt_archives import fallback_fetch
+    import fetch_archive
+
+    urls = [l.strip() for l in links_file.read_text().splitlines() if l.strip()]
+    failed_targets = []
+
+    for url in urls:
+        try:
+            target = fetch_archive.FetchTarget.from_wayback_url(url)
+        except ValueError:
+            continue
+        dest = output_dir / target.filename
+        # Consider it failed if file doesn't exist or is too small
+        if not dest.exists() or dest.stat().st_size < 500:
+            failed_targets.append(target)
+
+    if not failed_targets:
+        log.info("No failed URLs to retry via alternative archives")
+        return
+
+    log.info("Trying alternative archives (%s) for %d failed URLs...",
+             ", ".join(fallback_archives), len(failed_targets))
+
+    fetched = 0
+    async with aiohttp.ClientSession() as session:
+        for i, target in enumerate(failed_targets, 1):
+            content = await fallback_fetch(
+                session, target.original_url,
+                enabled_archives=fallback_archives,
+            )
+            if content:
+                dest = output_dir / target.filename
+                dest.write_bytes(content)
+                fetched += 1
+                timer.record_success("alt_archive")
+                log.info("  [%d/%d] ALT OK: %s", i, len(failed_targets), target.original_url[:60])
+            else:
+                timer.record_failure("alt_archive")
+
+            # Rate limit
+            await asyncio.sleep(1.0)
+
+    log.info("Alternative archives: %d / %d recovered", fetched, len(failed_targets))
 
 
 def _domain_from_filename(filename: str) -> str | None:
@@ -801,9 +868,20 @@ def main():
                         help="Max retries per URL (default: 3)")
     parser.add_argument("--backoff-factor", type=float, default=2.0,
                         help="Backoff multiplier between retries (default: 2.0)")
+    parser.add_argument("--fallback-archives", nargs="*", default=None,
+                        choices=["archive_today", "memento"],
+                        help="Try alternative archives for failed URLs after primary cascade "
+                             "(e.g., --fallback-archives archive_today memento)")
     args = parser.parse_args()
 
     config = load_config(Path(args.config))
+
+    # Also check config for alternative_archives setting
+    fallback_archives = args.fallback_archives
+    if fallback_archives is None and config.alternative_archives.get("enabled"):
+        fallback_archives = config.alternative_archives.get(
+            "sources", ["archive_today", "memento"]
+        )
 
     stages = {
         "index": run_index,
@@ -827,6 +905,7 @@ def main():
         workers=args.workers,
         max_retries=args.max_retries,
         backoff_factor=args.backoff_factor,
+        fallback_archives=fallback_archives,
     )
 
 
