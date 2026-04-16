@@ -3,15 +3,18 @@
 Pipeline stage runner — single CLI entry point for all stages.
 
 Usage:
-    python3 run_stage.py index   --config configs/yeezysupply.yaml [--dry-run]
-    python3 run_stage.py filter  --config configs/yeezysupply.yaml [--dry-run]
-    python3 run_stage.py fetch   --config configs/yeezysupply.yaml [--dry-run]
-    python3 run_stage.py match   --config configs/yeezysupply.yaml [--dry-run]
-    python3 run_stage.py download --config configs/yeezysupply.yaml [--dry-run]
-    python3 run_stage.py normalize --config configs/yeezysupply.yaml [--dry-run]
-    python3 run_stage.py build   --config configs/yeezysupply.yaml
+    python3 run_stage.py cdx_dump     --config configs/example.yaml [--dry-run]
+    python3 run_stage.py index        --config configs/example.yaml [--dry-run]
+    python3 run_stage.py filter       --config configs/example.yaml [--dry-run]
+    python3 run_stage.py fetch        --config configs/example.yaml [--dry-run]
+    python3 run_stage.py cdn_discover --config configs/example.yaml [--dry-run]
+    python3 run_stage.py match        --config configs/example.yaml [--dry-run]
+    python3 run_stage.py download     --config configs/example.yaml [--dry-run]
+    python3 run_stage.py normalize    --config configs/example.yaml [--dry-run]
+    python3 run_stage.py build        --config configs/example.yaml
+    python3 run_stage.py all          --config configs/example.yaml [--yes]
 
-Stage ordering: index → filter → fetch → match → download → normalize → build
+Stage ordering: cdx_dump → index → filter → fetch → cdn_discover → match → download → normalize → build
 """
 from __future__ import annotations
 
@@ -21,14 +24,16 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import aiohttp
 
-# Add library to path
-sys.path.insert(0, os.path.expanduser("~/lib"))
+# Add library to path (relative — self-contained)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "lib"))
 
 from wayback_archiver.site_config import load_config
 from wayback_archiver.checkpoint import StageCheckpoint
@@ -41,9 +46,74 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Repo root (for importing fetch_archive / filter_cdx) ──────────────────
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# ── Repo root (for importing fetch_archive / filter_cdx / shopify_downloader) ─
 sys.path.insert(0, str(REPO_ROOT))
+
+
+def run_cdx_dump(config, dry_run=False, **_kw):
+    """Stage 0: Run wayback_cdx_v2 to produce CDX dump files for each domain.
+
+    Invokes wayback_domain_dump.py as a subprocess for each configured domain.
+    Skips domains whose CDX files already exist and are recent (configurable).
+    Uses the bundled tools/wayback_cdx by default.
+    """
+    # Default to bundled tool; allow config override for external installs
+    cdx_tool = config._raw.get("cdx_tool", str(REPO_ROOT / "tools"))
+    cdx_tool_path = Path(cdx_tool).expanduser()
+    if not cdx_tool_path.exists():
+        log.error("cdx_tool path does not exist: %s", cdx_tool_path)
+        sys.exit(1)
+
+    max_age_days = config._raw.get("cdx_dump_max_age_days", 7)
+    proxy_mode = config._raw.get("cdx_dump_proxy_mode", "auto")
+    from_ts = config._raw.get("cdx_dump_from", "")
+    to_ts = config._raw.get("cdx_dump_to", "")
+
+    for domain in config.domains:
+        # Derive output path: same directory as existing cdx_files, or project_dir
+        safe_domain = domain.replace(".", "_").replace("/", "_")
+        cdx_path = config.project_path / f"{safe_domain}_wayback.txt"
+
+        # Check staleness
+        if cdx_path.exists():
+            age_days = (time.time() - cdx_path.stat().st_mtime) / 86400
+            if age_days < max_age_days:
+                log.info("CDX dump is fresh (%.1f days old): %s", age_days, cdx_path)
+                continue
+            log.info("CDX dump is stale (%.1f days old), re-dumping: %s", age_days, cdx_path)
+
+        cmd = [
+            sys.executable, "-m", "wayback_cdx",
+            "--domain", domain,
+            "--output", str(cdx_path),
+            "--resume",
+            "--proxy-mode", proxy_mode,
+        ]
+        if from_ts:
+            cmd += ["--from", str(from_ts)]
+        if to_ts:
+            cmd += ["--to", str(to_ts)]
+
+        if dry_run:
+            log.info("[DRY RUN] Would run: %s", " ".join(cmd))
+            log.info("[DRY RUN]   cwd=%s", cdx_tool_path)
+            continue
+
+        log.info("Running CDX dump for %s ...", domain)
+        log.info("  Command: %s", " ".join(cmd))
+        log.info("  Output: %s", cdx_path)
+
+        result = subprocess.run(cmd, cwd=str(cdx_tool_path))
+        if result.returncode != 0:
+            log.error("CDX dump failed for %s (exit code %d)", domain, result.returncode)
+        else:
+            log.info("CDX dump complete for %s", domain)
+
+        # Register the new CDX file in the config's cdx_files if not already there
+        cdx_str = str(cdx_path)
+        if cdx_str not in config.cdx_files:
+            config.cdx_files.append(cdx_str)
+            log.info("  Registered CDX file: %s", cdx_path)
 
 
 def run_index(config, dry_run=False, **_kw):
@@ -649,6 +719,232 @@ def _slug_from_html_filename(filename: str) -> str | None:
     return None
 
 
+def run_cdn_discover(config, dry_run=False, **_kw):
+    """Stage: Shopify CDN archaeology — discover all CDN image URLs.
+
+    Runs shopify_downloader.py's discovery functions to find every image URL
+    on Shopify's CDN for this store, including delisted/removed products.
+    Merges discovered URLs into the pipeline's links/{slug}.txt files.
+
+    No-op if shopify_cdn.enabled is not set in the config.
+    """
+    shopify_cfg = config._raw.get("shopify_cdn", {})
+    if not shopify_cfg.get("enabled"):
+        log.info("shopify_cdn not enabled — skipping CDN discovery")
+        return
+
+    # shopify_downloader.py is bundled at repo root; config can override
+    downloader_path = shopify_cfg.get("downloader_path", str(REPO_ROOT / "shopify_downloader.py"))
+    downloader_path = Path(downloader_path).expanduser()
+    if not downloader_path.exists():
+        log.error("shopify_downloader.py not found: %s", downloader_path)
+        return
+
+    # Lazy import — add parent dir to sys.path
+    dl_parent = str(downloader_path.parent)
+    if dl_parent not in sys.path:
+        sys.path.insert(0, dl_parent)
+    import shopify_downloader as sd
+
+    # Use the first domain as the primary store URL
+    store_domain = config.domains[0] if config.domains else None
+    if not store_domain:
+        log.error("No domains configured — cannot run CDN discovery")
+        return
+
+    base_url = f"https://{store_domain}"
+    myshopify = shopify_cfg.get("myshopify_domain", "")
+    myshopify_url = f"https://{myshopify}" if myshopify else None
+    full_size = shopify_cfg.get("full_size", True)
+    max_wayback_json = shopify_cfg.get("max_wayback_json", 200)
+
+    log.info("Shopify CDN discovery for %s", base_url)
+
+    # ── Layer 1: CDN prefix ───────────────────────────────────────────
+    cdn_prefix = shopify_cfg.get("cdn_prefix") or None
+    if not cdn_prefix:
+        # Try to find it from fetched HTML
+        html_dir = config.fetch_output_dir
+        if html_dir.exists():
+            for html_file in sorted(html_dir.glob("*.html"))[:20]:
+                content = html_file.read_text(errors="replace")[:5000]
+                m = sd._CDN_PREFIX_RE.search(content)
+                if m:
+                    cdn_prefix = f"1/{m.group(1)}"
+                    log.info("  Found CDN prefix from fetched HTML: %s", cdn_prefix)
+                    break
+
+        if not cdn_prefix:
+            cdn_prefix = sd.discover_cdn_prefix(base_url)
+
+    if cdn_prefix:
+        log.info("  CDN prefix: %s", cdn_prefix)
+    else:
+        log.warning("  Could not discover CDN prefix — CDX CDN queries will be limited")
+
+    # ── Layer 2: Access token ─────────────────────────────────────────
+    access_token = shopify_cfg.get("access_token") or None
+    if not access_token:
+        access_token = sd.discover_access_token(base_url, myshopify_url)
+    if access_token:
+        log.info("  Access token: %s...%s", access_token[:4], access_token[-4:])
+
+    if dry_run:
+        log.info("[DRY RUN] Would run Shopify CDN discovery with:")
+        log.info("  Store: %s", base_url)
+        log.info("  CDN prefix: %s", cdn_prefix)
+        log.info("  Access token: %s", "yes" if access_token else "no")
+        log.info("  Full size: %s", full_size)
+        return
+
+    all_cdn_urls: set[str] = set()
+    products_discovered: list[dict] = []
+
+    # ── Layer 3: Storefront API discovery ─────────────────────────────
+    if access_token:
+        try:
+            api_products = sd.discover_via_storefront_api(
+                base_url, access_token, myshopify_url,
+            )
+            if api_products:
+                products_discovered.extend(api_products)
+                api_urls = sd.extract_cdn_urls_from_products(api_products)
+                all_cdn_urls.update(api_urls)
+                log.info("  Storefront API: %d products, %d CDN URLs",
+                         len(api_products), len(api_urls))
+        except Exception as e:
+            log.warning("  Storefront API discovery failed: %s", e)
+
+    # ── Layer 4: Live store scraping ──────────────────────────────────
+    try:
+        live_products = sd.discover_products(base_url)
+        if live_products:
+            products_discovered.extend(live_products)
+            live_urls = sd.extract_cdn_urls_from_products(live_products)
+            all_cdn_urls.update(live_urls)
+            log.info("  Live scrape: %d products, %d CDN URLs",
+                     len(live_products), len(live_urls))
+    except Exception as e:
+        log.debug("  Live store scraping failed (store may be dead): %s", e)
+
+    # ── Layer 5: Wayback CDX CDN discovery ────────────────────────────
+    try:
+        wayback_urls, cdx_records = sd.discover_wayback_cdn_urls(
+            store_domain, cdn_prefix,
+        )
+        all_cdn_urls.update(wayback_urls)
+        log.info("  Wayback CDX: %d CDN URLs", len(wayback_urls))
+    except Exception as e:
+        log.warning("  Wayback CDX discovery failed: %s", e)
+        cdx_records = []
+
+    # ── Full-size URL normalization ───────────────────────────────────
+    if full_size:
+        normalized = set()
+        for url in all_cdn_urls:
+            normalized.add(sd.strip_shopify_size_suffix(url))
+        log.info("  After full-size normalization: %d → %d URLs",
+                 len(all_cdn_urls), len(normalized))
+        all_cdn_urls = normalized
+
+    # ── Layer 6: Liveness check ───────────────────────────────────────
+    skip_liveness = shopify_cfg.get("skip_liveness", False)
+    if not skip_liveness and all_cdn_urls:
+        alive_urls, dead_urls = sd.check_cdn_liveness(all_cdn_urls)
+        log.info("  Liveness: %d alive, %d dead", len(alive_urls), len(dead_urls))
+        downloadable_urls = alive_urls
+    else:
+        downloadable_urls = all_cdn_urls
+        dead_urls = set()
+
+    log.info("  Total downloadable CDN URLs: %d", len(downloadable_urls))
+
+    # ── Merge into pipeline's links/{slug}.txt ────────────────────────
+    config.links_dir.mkdir(exist_ok=True)
+    metadata = {}
+    if config.metadata_file.exists():
+        metadata = json.loads(config.metadata_file.read_text())
+
+    # Build a lookup: CDN filename fragment → product slug
+    merged_count = 0
+    unmatched_urls: list[str] = []
+
+    for url in sorted(downloadable_urls):
+        filename = sd.cdn_url_to_filename(url)
+
+        # Try to match against known product slugs
+        matched_slug = None
+        # Extract the product-relevant part from the CDN filename
+        # e.g. "products__dove-hoodie_800x.jpg" → "dove-hoodie"
+        parts = filename.split("__")
+        if len(parts) >= 2:
+            # Take the last part, strip extension and size suffix
+            candidate = parts[-1]
+            candidate = re.sub(r'\.\w+$', '', candidate)  # strip extension
+            candidate = re.sub(r'_\d+x\d*$', '', candidate)  # strip size suffix
+            candidate = re.sub(r'_(?:grande|medium|small|large|compact|master|pico|icon|thumb)$', '', candidate)
+            candidate = candidate.lower()
+
+            # Direct match
+            if candidate in metadata:
+                matched_slug = candidate
+            else:
+                # Try partial match: does any slug start with or contain this candidate?
+                for slug in metadata:
+                    if candidate and (slug.startswith(candidate) or candidate in slug):
+                        matched_slug = slug
+                        break
+
+        if matched_slug:
+            links_file = config.links_dir / f"{matched_slug}.txt"
+            existing = set()
+            if links_file.exists():
+                existing = set(links_file.read_text().splitlines())
+            if url not in existing:
+                with open(links_file, "a") as f:
+                    f.write(url + "\n")
+                merged_count += 1
+        else:
+            unmatched_urls.append(url)
+
+    # Write unmatched URLs to a catch-all file
+    if unmatched_urls:
+        unmatched_file = config.links_dir / "_cdn_unmatched.txt"
+        unmatched_file.write_text("\n".join(sorted(unmatched_urls)) + "\n")
+        log.info("  Merged %d URLs into product links, %d unmatched → %s",
+                 merged_count, len(unmatched_urls), unmatched_file)
+    else:
+        log.info("  Merged %d URLs into product links, all matched", merged_count)
+
+    # ── Save Shopify manifest ─────────────────────────────────────────
+    manifest = {
+        "store_url": base_url,
+        "cdn_prefix": cdn_prefix,
+        "access_token_found": bool(access_token),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "stats": {
+            "total_cdn_urls": len(all_cdn_urls),
+            "alive": len(downloadable_urls),
+            "dead": len(dead_urls),
+            "merged_to_products": merged_count,
+            "unmatched": len(unmatched_urls),
+            "products_from_api": len(products_discovered),
+            "cdx_records": len(cdx_records),
+        },
+        "products": [
+            {
+                "title": p.get("title", ""),
+                "handle": p.get("handle", ""),
+                "vendor": p.get("vendor", ""),
+            }
+            for p in products_discovered
+        ],
+    }
+    manifest_path = config.project_path / f"{config.name}_shopify_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    log.info("  Manifest written to %s", manifest_path)
+
+
 def run_match(config, dry_run=False, **_kw):
     """Stage 3: Fuzzy match slugs to SKUs."""
     from wayback_archiver.match import match_products
@@ -852,13 +1148,19 @@ def run_build(config, dry_run=False, **_kw):
     log.info("Written to %s", config.catalog_file)
 
 
+STAGE_ORDER = [
+    "cdx_dump", "index", "filter", "fetch", "cdn_discover",
+    "match", "download", "normalize", "build",
+]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Wayback Archive Pipeline")
-    parser.add_argument("stage", choices=[
-        "index", "filter", "fetch", "match", "download", "normalize", "build",
-    ])
+    parser.add_argument("stage", choices=STAGE_ORDER + ["all"])
     parser.add_argument("--config", required=True, help="Path to site config YAML")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="Skip confirmation prompts (for --all mode)")
     # fetch-specific options
     parser.add_argument("--proxy", choices=["isp", "dc"], default="isp",
                         help="Proxy type for fetch stage (default: isp)")
@@ -884,22 +1186,18 @@ def main():
         )
 
     stages = {
+        "cdx_dump": run_cdx_dump,
         "index": run_index,
         "filter": run_filter,
         "fetch": run_fetch,
+        "cdn_discover": run_cdn_discover,
         "match": run_match,
         "download": run_download,
         "normalize": run_normalize,
         "build": run_build,
     }
 
-    log.info("=" * 60)
-    log.info("Stage: %s | Site: %s | Dry-run: %s", args.stage, config.display_name, args.dry_run)
-    log.info("=" * 60)
-
-    # Pass CLI args as kwargs for stages that need them
-    stages[args.stage](
-        config,
+    kwargs = dict(
         dry_run=args.dry_run,
         proxy_type=args.proxy,
         workers=args.workers,
@@ -907,6 +1205,42 @@ def main():
         backoff_factor=args.backoff_factor,
         fallback_archives=fallback_archives,
     )
+
+    if args.stage == "all":
+        log.info("=" * 60)
+        log.info("FULL PIPELINE | Site: %s | Dry-run: %s", config.display_name, args.dry_run)
+        log.info("Stages: %s", " → ".join(STAGE_ORDER))
+        log.info("=" * 60)
+
+        # Confirmation gates for expensive stages
+        confirm_before = {"cdx_dump", "fetch", "download"}
+
+        for stage_name in STAGE_ORDER:
+            if stage_name in confirm_before and not args.dry_run and not args.yes:
+                try:
+                    answer = input(f"\nAbout to run '{stage_name}'. Continue? [Y/n] ")
+                except EOFError:
+                    answer = "y"
+                if answer.strip().lower() in ("n", "no"):
+                    log.info("Skipping %s (user declined)", stage_name)
+                    continue
+
+            log.info("")
+            log.info("=" * 60)
+            log.info("Stage: %s", stage_name)
+            log.info("=" * 60)
+            stages[stage_name](config, **kwargs)
+
+        log.info("")
+        log.info("=" * 60)
+        log.info("PIPELINE COMPLETE")
+        log.info("=" * 60)
+    else:
+        log.info("=" * 60)
+        log.info("Stage: %s | Site: %s | Dry-run: %s", args.stage, config.display_name, args.dry_run)
+        log.info("=" * 60)
+
+        stages[args.stage](config, **kwargs)
 
 
 if __name__ == "__main__":

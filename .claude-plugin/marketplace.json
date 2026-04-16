@@ -1,0 +1,13 @@
+{
+  "name": "rare-data-club",
+  "owner": {
+    "name": "Rare Data Club"
+  },
+  "plugins": [
+    {
+      "name": "wayback-archive",
+      "source": "./",
+      "description": "Recover product databases from defunct e-commerce sites via Wayback Machine, CommonCrawl, and Shopify CDN archaeology."
+    }
+  ]
+}

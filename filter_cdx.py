@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 
-INPUT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("yeezygap_com_wayback.txt")
+INPUT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("cdx_dump.txt")
 
 # ── Layer 1: Status whitelist ──────────────────────────────────────────────
 GOOD_STATUS = {"200"}
@@ -42,9 +42,9 @@ BAD_MIMES = {
 }
 
 # ── Layer 3: Junk path patterns ────────────────────────────────────────────
+# Infrastructure / boilerplate — safe to drop universally
 JUNK_PATH_RE = re.compile(r"""
     /robots\.txt |
-    /sitemap[_.]  |
     /favicon\.ico |
     /apple-touch-icon |
     /\.well-known/ |
@@ -56,8 +56,6 @@ JUNK_PATH_RE = re.compile(r"""
     /cart$ |
     /account/ |
     /admin/ |
-    /services/ |
-    /policies/ |
     /wpm@ |
     /sandbox/ |
     /monorail/ |
@@ -67,20 +65,10 @@ JUNK_PATH_RE = re.compile(r"""
     /_vercel/ |
     /shopifycloud/ |
     /password$ |
-    /pages/stores |
-    /pages/track$ |
-    /pages/contact$ |
-    /pages/.*-(?:in|cm)$ |
-    /pages/.*size-chart |
     /payments/ |
     /csp-report |
     /apple-app-site |
-    /blogs/ |
     /search(\?|$) |
-    /pages/faq |
-    /pages/submission |
-    /pages/international |
-    /pages/dove- |
     %22 |
     %3[CcEe] |
     %7[Bb] |

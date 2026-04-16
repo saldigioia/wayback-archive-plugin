@@ -304,7 +304,7 @@ async def fetch_wayback_direct(
     session: aiohttp.ClientSession,
     target: FetchTarget,
     semaphore: asyncio.Semaphore,
-    max_retries: int = 2,
+    max_retries: int = 3,
 ) -> Optional[bytes]:
     """Fetch a Wayback id_ URL directly (no proxy)."""
     id_url = _id_url(target.wayback_url)
@@ -319,12 +319,19 @@ async def fetch_wayback_direct(
                     headers=_WB_HEADERS,
                 ) as resp:
                     if resp.status == 429:
-                        wait = 3.0 * (2 ** attempt)
+                        wait = 5.0 * (2 ** attempt)
                         log.warning("  429 rate-limited (direct), waiting %.1fs", wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status == 503:
+                        # Wayback overloaded — back off
+                        wait = 3.0 * (2 ** attempt)
+                        log.warning("  503 overloaded (direct), waiting %.1fs", wait)
                         await asyncio.sleep(wait)
                         continue
                     if resp.status != 200:
                         log.debug("  Direct HTTP %d on attempt %d", resp.status, attempt + 1)
+                        await asyncio.sleep(0.5)
                         continue
 
                     content = await resp.read()
@@ -335,7 +342,7 @@ async def fetch_wayback_direct(
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 log.debug("  Direct error attempt %d: %s", attempt + 1, e)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(2.0 * (attempt + 1))
                 continue
     return None
 
@@ -528,33 +535,54 @@ async def run(
     proxy_sem = asyncio.Semaphore(workers)
     cc_sem = asyncio.Semaphore(4)
 
-    async with aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(limit=30),
-    ) as session:
-        tasks = [
-            fetch_one(t, session, proxy_config, output_dir, direct_sem, proxy_sem, cc_sem, resume)
-            for t in targets
-        ]
+    results: list[FetchResult] = []
+    t0 = time.time()
+    total = len(targets)
 
-        results: list[FetchResult] = []
-        done = 0
-        t0 = time.time()
+    async def _worker(queue: asyncio.Queue):
+        """Pull targets from queue, fetch, log progress."""
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit_per_host=6),
+        ) as session:
+            while True:
+                target = await queue.get()
+                try:
+                    result = await fetch_one(
+                        target, session, proxy_config, output_dir,
+                        direct_sem, proxy_sem, cc_sem, resume,
+                    )
+                    results.append(result)
 
-        for coro in asyncio.as_completed(tasks):
-            result = await coro
-            results.append(result)
-            done += 1
+                    status = "OK" if result.success else "FAIL"
+                    size_str = f"{result.size:,}B" if result.success else result.error
+                    elapsed = time.time() - t0
+                    rate = len(results) / elapsed if elapsed > 0 else 0
 
-            status = "OK" if result.success else "FAIL"
-            size_str = f"{result.size:,}B" if result.success else result.error
-            elapsed = time.time() - t0
-            rate = done / elapsed if elapsed > 0 else 0
+                    log.info(
+                        "[%d/%d] [%s] [%s] %s — %s  (%.1f/min)",
+                        len(results), total, status, result.method,
+                        result.target.original_url[:80], size_str, rate * 60,
+                    )
+                except Exception as e:
+                    results.append(FetchResult(target, False, "error", 0, str(e)))
+                    log.error("[%d/%d] [ERROR] %s — %s", len(results), total, target.original_url[:80], e)
+                finally:
+                    queue.task_done()
 
-            log.info(
-                "[%d/%d] [%s] [%s] %s — %s  (%.1f/min)",
-                done, len(targets), status, result.method,
-                result.target.original_url[:80], size_str, rate * 60,
-            )
+    # Feed targets through a queue with bounded workers instead of
+    # launching all tasks simultaneously (which causes Wayback 429 storms)
+    queue: asyncio.Queue = asyncio.Queue()
+    num_workers = workers + 5  # workers controls proxy concurrency; this controls overall inflight
+
+    worker_tasks = [asyncio.create_task(_worker(queue)) for _ in range(num_workers)]
+
+    for t in targets:
+        await queue.put(t)
+
+    await queue.join()
+
+    for wt in worker_tasks:
+        wt.cancel()
 
     # ── Summary ───────────────────────────────────────────────────────
     succeeded = [r for r in results if r.success]

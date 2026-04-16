@@ -3,8 +3,8 @@
 Pipeline progress dashboard — shows current state of an archival project.
 
 Usage:
-    python3 status_report.py --config configs/yeezysupply.yaml
-    python3 status_report.py --config configs/yeezysupply.yaml --final
+    python3 status_report.py --config configs/example.yaml
+    python3 status_report.py --config configs/example.yaml --final
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, os.path.expanduser("~/lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 from wayback_archiver.site_config import load_config
 from wayback_archiver.normalize import list_images, IMAGE_EXTENSIONS
