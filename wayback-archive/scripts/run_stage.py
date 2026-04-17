@@ -123,13 +123,19 @@ def run_index(config, dry_run=False, **_kw):
     products = {}
     for cdx_path in config.cdx_paths:
         log.info("Parsing CDX: %s", cdx_path)
-        products = parse_cdx(
+        file_products = parse_cdx(
             cdx_path,
             config.url_rules,
             config.era_rules,
             config.compiled_junk,
             config.type_priority,
         )
+        priority_map = {t: i for i, t in enumerate(config.type_priority)}
+        for slug, entry in file_products.items():
+            existing = products.get(slug)
+            if existing is None or priority_map.get(entry["url_type"], 99) < priority_map.get(existing["url_type"], 99):
+                products[slug] = entry
+        log.info("  + %d products from this file (running total: %d)", len(file_products), len(products))
 
     # Stats
     by_type = {}
