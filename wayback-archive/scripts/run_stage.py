@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -1160,6 +1161,64 @@ STAGE_ORDER = [
 ]
 
 
+def _emit_progress(progress_path: Path, stage: str, event: str, **extra) -> None:
+    """Append one JSON line describing a stage transition.
+
+    Best-effort: progress streaming must never break the pipeline. Silently
+    swallow any filesystem error.
+    """
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "stage": stage,
+        "event": event,
+    }
+    if extra:
+        record.update(extra)
+    try:
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        with progress_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
+def _run_with_progress(stage_name, stage_fn, config, progress_path, **kwargs):
+    """Invoke a stage, bracketing it with progress events.
+
+    Catches BaseException (including SystemExit) so the end-event still lands
+    when a stage calls sys.exit on fatal input. The exception is re-raised.
+    """
+    _emit_progress(progress_path, stage_name, "start")
+    t0 = time.time()
+    try:
+        stage_fn(config, **kwargs)
+    except BaseException as e:
+        kind = "exit" if isinstance(e, SystemExit) else "error"
+        _emit_progress(progress_path, stage_name, "end",
+                       wall_sec=round(time.time() - t0, 1),
+                       status=kind,
+                       error=f"{type(e).__name__}: {e}")
+        raise
+    _emit_progress(progress_path, stage_name, "end",
+                   wall_sec=round(time.time() - t0, 1),
+                   status="ok")
+
+
+def _run_audit(config_path: Path, progress_path: Path) -> int:
+    """Invoke audit.py as a subprocess; return its exit code. Emits progress events."""
+    _emit_progress(progress_path, "audit", "start")
+    t0 = time.time()
+    audit_script = Path(__file__).resolve().parent / "audit.py"
+    result = subprocess.run(
+        [sys.executable, str(audit_script), "--config", str(config_path)],
+    )
+    _emit_progress(progress_path, "audit", "end",
+                   wall_sec=round(time.time() - t0, 1),
+                   status="pass" if result.returncode == 0 else "residual",
+                   exit_code=result.returncode)
+    return result.returncode
+
+
 def main():
     parser = argparse.ArgumentParser(description="Wayback Archive Pipeline")
     parser.add_argument("stage", choices=STAGE_ORDER + ["all"])
@@ -1167,6 +1226,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Skip confirmation prompts (for --all mode)")
+    parser.add_argument("--auto", action="store_true",
+                        help="Turn-key mode: implies --yes, streams compact progress "
+                             "to projects/<name>/.progress.jsonl, runs audit at end.")
     # fetch-specific options
     parser.add_argument("--proxy", choices=["isp", "dc"], default="isp",
                         help="Proxy type for fetch stage (default: isp)")
@@ -1182,7 +1244,12 @@ def main():
                              "(e.g., --fallback-archives archive_today memento)")
     args = parser.parse_args()
 
+    # --auto implies --yes (no interactive prompts) and enables progress streaming.
+    if args.auto:
+        args.yes = True
+
     config = load_config(Path(args.config))
+    progress_path = config.project_path / ".progress.jsonl"
 
     # Also check config for alternative_archives setting
     fallback_archives = args.fallback_archives
@@ -1221,32 +1288,60 @@ def main():
         # Confirmation gates for expensive stages
         confirm_before = {"cdx_dump", "fetch", "download"}
 
-        for stage_name in STAGE_ORDER:
-            if stage_name in confirm_before and not args.dry_run and not args.yes:
-                try:
-                    answer = input(f"\nAbout to run '{stage_name}'. Continue? [Y/n] ")
-                except EOFError:
-                    answer = "y"
-                if answer.strip().lower() in ("n", "no"):
-                    log.info("Skipping %s (user declined)", stage_name)
-                    continue
+        if args.auto:
+            _emit_progress(progress_path, "pipeline", "start",
+                           stages=STAGE_ORDER, site=config.display_name)
 
-            log.info("")
-            log.info("=" * 60)
-            log.info("Stage: %s", stage_name)
-            log.info("=" * 60)
-            stages[stage_name](config, **kwargs)
+        pipeline_status = "aborted"  # set to "complete" only if we reach the end
+        try:
+            for stage_name in STAGE_ORDER:
+                if stage_name in confirm_before and not args.dry_run and not args.yes:
+                    try:
+                        answer = input(f"\nAbout to run '{stage_name}'. Continue? [Y/n] ")
+                    except EOFError:
+                        answer = "y"
+                    if answer.strip().lower() in ("n", "no"):
+                        log.info("Skipping %s (user declined)", stage_name)
+                        if args.auto:
+                            _emit_progress(progress_path, stage_name, "skipped", reason="user_declined")
+                        continue
+
+                log.info("")
+                log.info("=" * 60)
+                log.info("Stage: %s", stage_name)
+                log.info("=" * 60)
+                if args.auto:
+                    _run_with_progress(stage_name, stages[stage_name], config, progress_path, **kwargs)
+                else:
+                    stages[stage_name](config, **kwargs)
+
+            pipeline_status = "complete"
+        finally:
+            if args.auto and pipeline_status != "complete":
+                _emit_progress(progress_path, "pipeline", "end", status=pipeline_status)
 
         log.info("")
         log.info("=" * 60)
         log.info("PIPELINE COMPLETE")
         log.info("=" * 60)
+
+        if args.auto and not args.dry_run:
+            # Protocol IV: audit before declaring the pass complete.
+            _emit_progress(progress_path, "pipeline", "audit")
+            audit_exit = _run_audit(Path(args.config), progress_path)
+            _emit_progress(progress_path, "pipeline", "end",
+                           status="pass" if audit_exit == 0 else "residual",
+                           audit_exit=audit_exit)
+            sys.exit(audit_exit)
     else:
         log.info("=" * 60)
         log.info("Stage: %s | Site: %s | Dry-run: %s", args.stage, config.display_name, args.dry_run)
         log.info("=" * 60)
 
-        stages[args.stage](config, **kwargs)
+        if args.auto:
+            _run_with_progress(args.stage, stages[args.stage], config, progress_path, **kwargs)
+        else:
+            stages[args.stage](config, **kwargs)
 
 
 if __name__ == "__main__":
