@@ -7,3 +7,6 @@ __pycache__/
 *~
 .claude/
 projects/
+
+# Pipeline checkpoint state (hidden per-host resume files in tools/)
+*.ckpt.json

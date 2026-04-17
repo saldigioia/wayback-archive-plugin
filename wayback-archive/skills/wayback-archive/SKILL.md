@@ -36,6 +36,18 @@ Phase 3: ASSET DOWNLOAD  -> Get images/media (live CDN first, Wayback fallback)
 
 For detailed extraction strategy and method hierarchy, see [references/extraction-strategy.md](references/extraction-strategy.md).
 
+## Archival Discipline (Standing Protocols)
+
+These five protocols are invariant. Violating any one of them means the pipeline is reporting progress it has not earned. See [../../docs/IMPROVEMENT_PLAN.md](../../docs/IMPROVEMENT_PLAN.md) for full rationale, phased execution, and the ledger schema that enforces them.
+
+1. **Entity-first.** The unit of accounting is the product entity, not the captured file. A saved feed, sitemap, or collection HTML with no downstream expansion is not progress.
+2. **Discovery is recursive.** Feeds, sitemaps, collection pages, homepages, search results, and JSON endpoints are discovery surfaces — never terminal artifacts. Every parse must emit outlinks into the ledger before the surface is marked processed.
+3. **New host → immediate enumeration.** Any previously unseen hostname observed in any capture triggers an automatic CDX dump and product-URL enumeration. Do not wait for a human prompt.
+4. **No "done" without audit.** Before reporting completion, answer five questions numerically: unresolved entities, unexpanded surfaces, index-missing entries, unenumerated hosts, retry-queue depth. Any non-zero count blocks the "done" claim unless annotated with a `terminal_reason`.
+5. **Validate before counting.** Extracted strings are candidates, not slugs. Normalize → classify → reject non-product URLs (image assets, CDN paths) → dedupe against the index → report *candidates seen* and *validated-and-new* separately.
+
+**Source-hierarchy priority** (drain highest-value first): `json_api > sitemap > feed > collection > home > search > product`. Prior runs burned time on HTML shells while `products.json?limit=1000` dumps sat unfetched — always prefer structured endpoints.
+
 ## Quick Start
 
 ```bash
@@ -138,3 +150,4 @@ For detailed script documentation, see [references/tool-reference.md](references
 - [references/data-contracts.md](references/data-contracts.md) — JSON schemas for stage inputs/outputs
 - [references/playwright-wayback.md](references/playwright-wayback.md) — Last-resort Playwright extraction pattern
 - [references/lessons-learned.md](references/lessons-learned.md) — Anti-patterns and best practices
+- [../../docs/IMPROVEMENT_PLAN.md](../../docs/IMPROVEMENT_PLAN.md) — Multi-phase analysis/brainstorm/edit plan enforcing the standing protocols
