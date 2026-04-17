@@ -73,6 +73,16 @@ python3 scripts/run_stage.py resume --config projects/mystore/config.yaml --auto
 - `pip install -r wayback-archive/requirements.txt`
 - Proxy credentials (optional, for large-scale CDX dumps): copy `wayback-archive/tools/.env.example` to `wayback-archive/tools/.env` and fill in `OXY_ISP_USER` / `OXY_ISP_PASS`. The dotenv file auto-loads — no `export` needed.
 
+## Where projects land
+
+Recovered catalogs live at `<projects-root>/<name>/`. Precedence for the root:
+
+1. `--project-root <path>` on `bootstrap.py`
+2. `$WAYBACK_ARCHIVE_ROOT` environment variable
+3. `~/wayback-archive/` (default)
+
+**Intentionally outside the plugin install dir.** When the plugin is installed via `/plugin install`, its files live at `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/` and get replaced on every version update — placing projects there means a plugin update silently wipes every recovered catalog. The user home default persists across plugin installs.
+
 ## Pipeline
 
 ```
