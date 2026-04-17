@@ -37,6 +37,7 @@ sys.path.insert(0, str(REPO_ROOT / "lib"))
 from wayback_archiver.site_config import load_config
 from wayback_archiver.util import build_dir_to_slug_map, find_empty_dirs
 from wayback_archiver.normalize import IMAGE_EXTENSIONS
+from wayback_archiver import ledger as ledger_mod
 
 
 DISCOVERY_SURFACE_PATTERNS = [
@@ -161,30 +162,79 @@ def _retry_queue_depth(config) -> tuple[int, list[str], dict]:
 
 def audit(config_path: Path, exemplar_cap: int = 20) -> tuple[dict, int]:
     config = load_config(config_path)
+    ledger_available = ledger_mod.exists(config.project_path)
+    mode = "ledger" if ledger_available else "pre-ledger"
 
-    u_slugs, u_slugs_ex, u_slugs_raw = _unresolved_slugs(config)
-    u_surf, u_surf_ex, u_surf_raw = _unexpanded_surfaces(config)
+    # Always compute these from disk — cheap and mode-independent.
     i_miss, i_miss_ex, i_miss_raw = _index_missing(config)
-    u_hosts, u_hosts_ex = _unenumerated_hosts(config)
-    rq_depth, rq_ex, rq_raw = _retry_queue_depth(config)
+    u_slugs_pre, u_slugs_pre_ex, u_slugs_raw = _unresolved_slugs(config)  # for raw counts
+    u_surf_pre, _u_surf_pre_ex, u_surf_raw = _unexpanded_surfaces(config)
+    rq_pre, _rq_pre_ex, rq_raw = _retry_queue_depth(config)
+    hosts_pre, hosts_pre_ex = _unenumerated_hosts(config)
 
-    integers = {
-        "unresolved_slugs": u_slugs,
-        "unexpanded_surfaces": u_surf,
-        "index_missing": i_miss,
-        "unenumerated_hosts": u_hosts,
-        "retry_queue_depth": rq_depth,
-    }
+    if ledger_available:
+        with ledger_mod.connect(config.project_path) as conn:
+            snap = ledger_mod.audit_snapshot(conn, exemplar_cap=exemplar_cap)
+        integers = {
+            "unresolved_slugs": snap["integers"]["unresolved_slugs"],
+            "unexpanded_surfaces": snap["integers"]["unexpanded_surfaces"],
+            "index_missing": i_miss,
+            "unenumerated_hosts": snap["integers"]["unenumerated_hosts"],
+            "retry_queue_depth": snap["integers"]["retry_queue_depth"],
+        }
+        exemplars = {
+            "unresolved_slugs": snap["exemplars"]["unresolved_slugs"][:exemplar_cap],
+            "unexpanded_surfaces": snap["exemplars"]["unexpanded_surfaces"][:exemplar_cap],
+            "index_missing": i_miss_ex[:exemplar_cap],
+            "unenumerated_hosts": snap["exemplars"]["unenumerated_hosts"][:exemplar_cap],
+            "retry_queue_depth": snap["exemplars"]["retry_queue_depth"][:exemplar_cap],
+        }
+        entities_total = snap["raw_counts"]["entities_total"]
+        entities_resolved = snap["raw_counts"]["entities_resolved"]
+        surfaces_total = snap["raw_counts"]["surfaces_total"]
+        hosts_total = snap["raw_counts"]["hosts_total"]
+        mode_notes = [
+            "Ledger present — unresolved_slugs / unexpanded_surfaces / unenumerated_hosts / retry_queue_depth are exact.",
+        ]
+    else:
+        integers = {
+            "unresolved_slugs": u_slugs_pre,
+            "unexpanded_surfaces": u_surf_pre,
+            "index_missing": i_miss,
+            "unenumerated_hosts": hosts_pre,
+            "retry_queue_depth": rq_pre,
+        }
+        exemplars = {
+            "unresolved_slugs": u_slugs_pre_ex[:exemplar_cap],
+            "unexpanded_surfaces": [],
+            "index_missing": i_miss_ex[:exemplar_cap],
+            "unenumerated_hosts": hosts_pre_ex[:exemplar_cap],
+            "retry_queue_depth": [],
+        }
+        entities_total = u_slugs_raw.get("index", 0)
+        entities_resolved = u_slugs_raw.get("metadata", 0)
+        surfaces_total = u_surf_raw.get("discovery_files_on_disk", 0)
+        hosts_total = len(config.domains)
+        mode_notes = [
+            "No ledger found (pre-ledger mode). unexpanded_surfaces integer is always 0; discovery_surfaces_on_disk in raw_counts is informational.",
+            "retry_queue_depth == fetch_stats.total_failure; terminal vs retriable distinction needs ledger. Run `python3 scripts/ledger.py init --config <cfg>` to enable exact counts.",
+        ]
+
     residual_total = sum(integers.values())
     status = "pass" if residual_total == 0 else "residual"
 
-    # Extra pre-ledger raw counts for operator awareness
+    # Stable raw_counts schema — same keys in both modes so the human
+    # renderer and downstream consumers don't need to branch.
     raw_counts = {
         "index": u_slugs_raw.get("index", 0),
         "metadata": u_slugs_raw.get("metadata", 0),
+        "entities_total": entities_total,
+        "entities_resolved": entities_resolved,
+        "surfaces_total": surfaces_total,
         "products_with_images": _count_products_with_images(config),
         "hosts_configured": len(config.domains),
-        "hosts_dumped": len(config.domains) - u_hosts,
+        "hosts_total": hosts_total,
+        "hosts_dumped": hosts_total - integers["unenumerated_hosts"],
         "fetch_success": rq_raw.get("total_success", 0),
         "fetch_failure": rq_raw.get("total_failure", 0),
         "discovery_surfaces_on_disk": u_surf_raw.get("discovery_files_on_disk", 0),
@@ -192,26 +242,11 @@ def audit(config_path: Path, exemplar_cap: int = 20) -> tuple[dict, int]:
         "catalog_entries": _count_catalog(config),
     }
 
-    exemplars = {
-        "unresolved_slugs": u_slugs_ex[:exemplar_cap],
-        "unexpanded_surfaces": u_surf_ex[:exemplar_cap],
-        "index_missing": i_miss_ex[:exemplar_cap],
-        "unenumerated_hosts": u_hosts_ex[:exemplar_cap],
-        "retry_queue_depth": rq_ex[:exemplar_cap],
-    }
-
-    pre_ledger_notes = [
-        "unexpanded_surfaces integer is always 0 in pre-ledger mode — raw discovery_files_on_disk is informational.",
-        "retry_queue_depth == fetch_stats.total_failure; terminal vs retriable distinction needs ledger (IMPROVEMENT_PLAN C3).",
-    ]
-    if u_surf_raw.get("discovery_files_on_disk", 0) and u_slugs == 0:
-        # If we have discovery files AND all index slugs resolved, expansion probably happened.
-        pre_ledger_notes.append(
-            f"{u_surf_raw['discovery_files_on_disk']} discovery surfaces on disk; all index slugs resolved — expansion likely complete."
-        )
+    pre_ledger_notes = mode_notes
 
     audit_result: dict = {
         "status": status,
+        "mode": mode,
         "integers": integers,
         "residual_total": residual_total,
         "raw_counts": raw_counts,
@@ -260,15 +295,22 @@ def _count_catalog(config) -> int:
 def _render_human(result: dict) -> str:
     ints = result["integers"]
     raw = result["raw_counts"]
+    mode = result.get("mode", "pre-ledger")
+    surf_detail = (
+        f"({raw['surfaces_total']} surfaces, {raw['surfaces_total'] - ints['unexpanded_surfaces']} parsed)"
+        if mode == "ledger"
+        else f"({raw['discovery_surfaces_on_disk']} discovery files on disk, pre-ledger)"
+    )
     lines = [
         f"Audit status: {result['status'].upper()}"
-        + (f"  ({result['residual_total']} residual items)" if result["status"] == "residual" else ""),
+        + (f"  ({result['residual_total']} residual items)" if result["status"] == "residual" else "")
+        + f"   [mode: {mode}]",
         "",
         "Five-question audit (Protocol IV):",
-        f"  1. unresolved_slugs     : {ints['unresolved_slugs']:>6}   (index {raw['index']} − metadata {raw['metadata']})",
-        f"  2. unexpanded_surfaces  : {ints['unexpanded_surfaces']:>6}   ({raw['discovery_surfaces_on_disk']} discovery files on disk, pre-ledger)",
+        f"  1. unresolved_slugs     : {ints['unresolved_slugs']:>6}   (entities {raw['entities_total']} − resolved {raw['entities_resolved']})",
+        f"  2. unexpanded_surfaces  : {ints['unexpanded_surfaces']:>6}   {surf_detail}",
         f"  3. index_missing        : {ints['index_missing']:>6}   (metadata {raw['metadata']} − with-images {raw['products_with_images']})",
-        f"  4. unenumerated_hosts   : {ints['unenumerated_hosts']:>6}   (configured {raw['hosts_configured']} − dumped {raw['hosts_dumped']})",
+        f"  4. unenumerated_hosts   : {ints['unenumerated_hosts']:>6}   (tracked {raw['hosts_total']} − dumped {raw['hosts_dumped']})",
         f"  5. retry_queue_depth    : {ints['retry_queue_depth']:>6}   (fetch failures; {raw['circuit_breaker_tripped']} CB-tripped domains)",
         "",
         f"Catalog: {raw['catalog_entries']} entries  ·  Images: {raw['products_with_images']} products",

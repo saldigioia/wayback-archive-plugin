@@ -38,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "lib"))
 
 from wayback_archiver.http_client import DEFAULT_HEADERS, BROWSER_HEADERS  # noqa: E402
+from wayback_archiver import ledger as ledger_mod  # noqa: E402
 
 TEMPLATE_DIR = REPO_ROOT / "skills" / "wayback-archive" / "configs"
 PROJECTS_DIR = REPO_ROOT / "projects"
@@ -367,6 +368,21 @@ def bootstrap(raw_input: str, name_override: str | None = None, dry_run: bool = 
         project_dir.mkdir(parents=True, exist_ok=True)
         config_path.write_text(config_yaml)
         plan_path.write_text(json.dumps(plan, indent=2))
+
+        # Protocol III prerequisite: seed the ledger with every host we've
+        # identified so the `unenumerated_hosts` count has a baseline to
+        # shrink against as CDX dumps complete. Ledger write failures are
+        # non-fatal — the pipeline still runs without a ledger.
+        try:
+            ledger_mod.init(project_dir)
+            with ledger_mod.connect(project_dir) as conn:
+                ledger_mod.upsert_hosts(conn, hosts)
+            plan["ledger_path"] = str((project_dir / "ledger.db").relative_to(REPO_ROOT))
+            plan["ledger_hosts_seeded"] = len(hosts)
+            plan_path.write_text(json.dumps(plan, indent=2))
+        except Exception as e:  # noqa: BLE001
+            plan["ledger_error"] = f"{type(e).__name__}: {e}"
+            plan_path.write_text(json.dumps(plan, indent=2))
 
     return plan
 

@@ -40,6 +40,7 @@ from wayback_archiver.site_config import load_config
 from wayback_archiver.checkpoint import StageCheckpoint
 from wayback_archiver.resilience import CircuitBreaker, StageTimer
 from wayback_archiver.http_client import AIOHTTP_HEADERS, USER_AGENT
+from wayback_archiver import ledger as ledger_mod
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,6 +51,46 @@ log = logging.getLogger(__name__)
 
 # ── Repo root (for importing fetch_archive / filter_cdx / shopify_downloader) ─
 sys.path.insert(0, str(REPO_ROOT))
+
+
+def _ledger_write(project_dir, fn):
+    """Run a ledger write callable, swallowing any exception.
+
+    The ledger is supplemental to on-disk state — the pipeline must keep
+    running if the ledger is missing, corrupt, or locked. Failures log at
+    DEBUG so they don't pollute the main stream.
+    """
+    try:
+        if not ledger_mod.exists(project_dir):
+            return
+        with ledger_mod.connect(project_dir) as conn:
+            fn(conn)
+    except Exception as e:  # noqa: BLE001
+        log.debug("ledger write failed (ignored): %s", e)
+
+
+def _import_entities_from_products(conn, products: dict, source: str, fallback_domains: list[str]) -> None:
+    """Upsert (slug, host, canonical_url, first_seen_in) rows for every product."""
+    from urllib.parse import urlparse as _urlparse
+    fallback = (fallback_domains[0] if fallback_domains else "unknown").lower()
+    rows: list[tuple[str, str, str | None, str | None]] = []
+    hosts_seen: set[str] = set()
+    for slug, entry in products.items():
+        canonical = entry.get("original_url") or entry.get("wayback_url") or None
+        host = fallback
+        if entry.get("original_url"):
+            try:
+                parsed_host = _urlparse(entry["original_url"]).hostname
+                if parsed_host:
+                    host = parsed_host.lower().rstrip(".")
+            except ValueError:
+                pass
+        hosts_seen.add(host)
+        rows.append((slug, host, canonical, source))
+    if rows:
+        ledger_mod.upsert_entities(conn, rows)
+    if hosts_seen:
+        ledger_mod.upsert_hosts(conn, hosts_seen)
 
 
 def run_cdx_dump(config, dry_run=False, **_kw):
@@ -110,6 +151,15 @@ def run_cdx_dump(config, dry_run=False, **_kw):
             log.error("CDX dump failed for %s (exit code %d)", domain, result.returncode)
         else:
             log.info("CDX dump complete for %s", domain)
+            # Protocol III: mark this host as enumerated so the audit's
+            # unenumerated_hosts count shrinks immediately.
+            _ledger_write(
+                config.project_path,
+                lambda c, d=domain: (
+                    ledger_mod.upsert_hosts(c, [d]),
+                    ledger_mod.mark_host_dumped(c, d),
+                ),
+            )
 
         # Register the new CDX file in the config's cdx_files if not already there
         cdx_str = str(cdx_path)
@@ -161,6 +211,13 @@ def run_index(config, dry_run=False, **_kw):
 
     config.index_file.write_text(json.dumps(products, indent=2, sort_keys=False))
     log.info("Written to %s", config.index_file)
+
+    # Ledger sync: upsert every indexed slug as an entity so the audit can
+    # report exact unresolved_slugs counts. Silent on ledger-write failure.
+    _ledger_write(
+        config.project_path,
+        lambda c, prods=products, src=str(config.index_file): _import_entities_from_products(c, prods, src, config.domains),
+    )
 
     # ── Pass 2: CommonCrawl discovery ──────────────────────────────────
     log.info("")
