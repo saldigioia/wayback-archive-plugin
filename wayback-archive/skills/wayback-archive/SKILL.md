@@ -106,9 +106,15 @@ Drain highest-value surfaces first: `json_api > sitemap > feed > collection > ho
 
 ## Fallback playbook
 
-- **Platform misdetected.** Inspect `projects/<name>/config.yaml`, pick a different template from `skills/wayback-archive/configs/_template_*.yaml`, swap the `cdn_patterns` / `url_rules` blocks, re-run stages from `filter` onward.
+- **Residuals after audit.** The preferred path is the `resume` subcommand — it reads `projects/<name>/audit.json`, picks the largest non-zero bucket, and runs only the stage that would shrink it:
+  ```bash
+  python3 scripts/run_stage.py resume --config <cfg> --auto
+  ```
+  Bucket → stage mapping: `unenumerated_hosts` → `cdx_dump`, `unresolved_slugs` → `fetch`, `retry_queue_depth` → `fetch --proxy dc --fallback-archives archive_today memento`, `index_missing` → `download`. Override auto-pick with `--bucket <name>`.
+- **Preflight blocked the run.** Read `projects/<name>/preflight.json`. Missing Oxylabs creds: copy `tools/.env.example` → `tools/.env` and fill in (auto-sourced, no `export` needed). Missing deps: `pip install -r requirements.txt`. Low disk: free space or change `project_dir`. Archive.org unreachable: retry or check VPN/DNS.
+- **Platform misdetected.** Inspect `projects/<name>/config.yaml`, pick a different template from `skills/wayback-archive/configs/_template_*.yaml`, swap the `cdn_patterns` / `url_rules` blocks, re-run `resume` or the specific stages from `filter` onward.
 - **CDX tool hangs.** Checkpoint files live at `tools/.<domain>_wayback.ckpt.json`. Resume: `cd tools && python -m wayback_cdx --domain <d> --output ../projects/<name>/<d>_wayback.txt --resume`.
-- **Low fetch success (<20%).** Switch proxy type: `python3 scripts/run_stage.py fetch --config <cfg> --proxy dc`. Or add alt archives: `--fallback-archives archive_today memento`.
+- **Low fetch success (<20%).** Let `resume` pick it up via the `retry_queue_depth` bucket, or run `fetch` directly with `--proxy dc --fallback-archives archive_today memento`.
 - **Anti-bot / CAPTCHA blocks.** Fall back to HAR-based recovery — see `references/playwright-wayback.md`.
 
 ## Reference docs (load only when needed — not preemptively)
