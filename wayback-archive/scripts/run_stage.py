@@ -72,6 +72,85 @@ def _ledger_write(project_dir, fn):
         log.debug("ledger write failed (ignored): %s", e)
 
 
+def _classify_fetch_failure(error: str) -> tuple[str, int]:
+    """Map a FetchResult.error string to a (failure_class, status_code) pair.
+
+    Best-effort. Unknown / catch-all failures default to ("network", 0).
+    """
+    e = (error or "").lower()
+    if "429" in e or "rate" in e or "throttle" in e:
+        return ("throttle", 429)
+    if "404" in e or "not found" in e:
+        return ("http_404", 404)
+    if "503" in e or "502" in e or "500" in e or "5xx" in e:
+        return ("http_5xx", 500)
+    if "timeout" in e or "timed out" in e or "dns" in e or "connection" in e:
+        return ("network", 0)
+    if "parse" in e or "invalid" in e or "corrupt" in e:
+        return ("parse", 0)
+    return ("network", 0)
+
+
+_SURFACE_CLASS_BY_TIER = {
+    "structured": "json_api",   # .atom / .json / .oembed — outlink-bearing
+    "collection": "collection",
+    "homepage":   "home",
+    # "html" (product pages) are entities, not surfaces — don't track here.
+}
+
+
+def _import_fetch_results(conn, jsonl_path: Path) -> None:
+    """Parse fetch_results.jsonl into ledger.fetch_attempts + mark entities resolved.
+
+    One `record_fetch` row per URL. For product-tier URLs that succeeded,
+    mark_entity_resolved based on the slug parsed from the original_url.
+    For non-product tiers (structured/collection/homepage), upsert and mark
+    the URL as a parsed discovery surface — the current pipeline extracts
+    from these immediately after fetch, so fetched==parsed in practice.
+    Precise outlink_count tracking is deferred to Phase 3b2.
+    """
+    import json as _json
+    from urllib.parse import urlparse as _urlparse
+    _SLUG_RE = re.compile(r"/products?/([^/?#]+)")
+
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+
+            url = rec.get("original_url") or ""
+            if not url:
+                continue
+
+            try:
+                host = (_urlparse(url).hostname or "").lower().rstrip(".")
+            except ValueError:
+                host = ""
+
+            if rec.get("success"):
+                ledger_mod.record_fetch(conn, url, 200, "ok")
+
+                tier = rec.get("tier", "")
+                surface_class = _SURFACE_CLASS_BY_TIER.get(tier)
+                if surface_class and host:
+                    ledger_mod.upsert_surface(conn, url, host, surface_class)
+                    ledger_mod.mark_surface_fetched(conn, url)
+                    ledger_mod.mark_surface_parsed(conn, url, outlink_count=0)
+                elif tier == "html":
+                    # Product page — resolve the entity.
+                    m = _SLUG_RE.search(url)
+                    if m and host:
+                        ledger_mod.mark_entity_resolved(conn, m.group(1), host)
+            else:
+                failure_class, status_code = _classify_fetch_failure(rec.get("error", ""))
+                ledger_mod.record_fetch(conn, url, status_code, failure_class)
+
+
 def _import_entities_from_products(conn, products: dict, source: str, fallback_domains: list[str]) -> None:
     """Upsert (slug, host, canonical_url, first_seen_in) rows for every product."""
     from urllib.parse import urlparse as _urlparse
@@ -545,6 +624,16 @@ def run_fetch(config, dry_run=False, proxy_type="isp", workers=5, max_retries=3,
         dry_run=False,
     ))
     fetch_elapsed = time.time() - t0
+
+    # ── Phase A.1: Ledger sync from fetch_results.jsonl ────────────────
+    # fetch_archive.py emits one JSON line per URL. Import those into
+    # fetch_attempts + resolve entities whose slug shows a successful fetch.
+    results_path = output_dir.parent / "fetch_results.jsonl"
+    if results_path.exists():
+        _ledger_write(
+            config.project_path,
+            lambda c, p=results_path: _import_fetch_results(c, p),
+        )
 
     # ── Phase A.5: Fallback archives for failed URLs ───────────────────
     fallback_archives = _kw.get("fallback_archives")

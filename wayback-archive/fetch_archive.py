@@ -602,6 +602,27 @@ async def run(
     for wt in worker_tasks:
         wt.cancel()
 
+    # ── Per-URL results JSONL ─────────────────────────────────────────
+    # Sibling to fetch_stats.json. Lets run_stage.py populate the ledger
+    # with one row per URL fetch without touching the async internals here.
+    results_path = output_dir.parent / "fetch_results.jsonl"
+    try:
+        with results_path.open("w", encoding="utf-8") as f:
+            for r in results:
+                f.write(json.dumps({
+                    "original_url": r.target.original_url,
+                    "wayback_url": r.target.wayback_url,
+                    "timestamp": r.target.timestamp,
+                    "tier": r.target.tier,
+                    "success": r.success,
+                    "method": r.method,
+                    "size": r.size,
+                    "error": r.error or "",
+                }) + "\n")
+        log.info("Per-URL results written to %s", results_path)
+    except OSError as e:
+        log.warning("Could not write fetch_results.jsonl: %s", e)
+
     # ── Summary ───────────────────────────────────────────────────────
     succeeded = [r for r in results if r.success]
     failed = [r for r in results if not r.success]
