@@ -50,6 +50,15 @@ from urllib.parse import quote
 
 import aiohttp
 
+# Make the shared HTTP hygiene module importable whether fetch_archive.py is
+# run as a script (cwd=repo root) or imported from run_stage.py.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE / "lib") not in sys.path:
+    sys.path.insert(0, str(_HERE / "lib"))
+from wayback_archiver.http_client import (
+    BROWSER_UA, USER_AGENT, AIOHTTP_HEADERS, parse_retry_after,
+)
+
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -288,9 +297,10 @@ async def fetch_cc_warc(
 # ── Wayback Fetch (direct first, proxy fallback) ─────────────────────────
 
 _WB_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36",
+    # Wayback's replay framework degrades for non-browser clients, so we keep
+    # the Mozilla string as base and append our AI-agent suffix (the pattern
+    # the Internet Archive's own `ia` skill endorses).
+    "User-Agent": BROWSER_UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
@@ -319,8 +329,10 @@ async def fetch_wayback_direct(
                     headers=_WB_HEADERS,
                 ) as resp:
                     if resp.status == 429:
-                        wait = 5.0 * (2 ** attempt)
-                        log.warning("  429 rate-limited (direct), waiting %.1fs", wait)
+                        retry_after = parse_retry_after(resp.headers.get("Retry-After"))
+                        wait = retry_after if retry_after is not None else 5.0 * (2 ** attempt)
+                        src = "Retry-After" if retry_after is not None else "backoff"
+                        log.warning("  429 rate-limited (direct, %s), waiting %.1fs", src, wait)
                         await asyncio.sleep(wait)
                         continue
                     if resp.status == 503:
@@ -369,8 +381,10 @@ async def fetch_wayback_proxied(
                     headers=_WB_HEADERS,
                 ) as resp:
                     if resp.status == 429:
-                        wait = 2.0 * (2 ** attempt)
-                        log.warning("  429 rate-limited (proxy), waiting %.1fs (attempt %d)", wait, attempt + 1)
+                        retry_after = parse_retry_after(resp.headers.get("Retry-After"))
+                        wait = retry_after if retry_after is not None else 2.0 * (2 ** attempt)
+                        src = "Retry-After" if retry_after is not None else "backoff"
+                        log.warning("  429 rate-limited (proxy, %s), waiting %.1fs (attempt %d)", src, wait, attempt + 1)
                         await asyncio.sleep(wait)
                         continue
 
@@ -543,6 +557,7 @@ async def run(
         """Pull targets from queue, fetch, log progress."""
         async with aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit_per_host=6),
+            headers=AIOHTTP_HEADERS,  # bot UA; per-request BROWSER_UA override via _WB_HEADERS
         ) as session:
             while True:
                 target = await queue.get()

@@ -35,6 +35,10 @@ from urllib.parse import urlparse
 import requests
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "lib"))
+
+from wayback_archiver.http_client import DEFAULT_HEADERS, BROWSER_HEADERS  # noqa: E402
+
 TEMPLATE_DIR = REPO_ROOT / "skills" / "wayback-archive" / "configs"
 PROJECTS_DIR = REPO_ROOT / "projects"
 
@@ -121,7 +125,7 @@ def enumerate_hosts_via_wayback(apex: str, timeout: float = 20.0) -> list[str]:
         f"?url=*.{apex}&output=json&fl=original&collapse=urlkey&limit=5000"
     )
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "wayback-archive-bootstrap/1.0"})
+        r = requests.get(url, timeout=timeout, headers=DEFAULT_HEADERS)
         r.raise_for_status()
         rows = r.json()
     except (requests.RequestException, ValueError):
@@ -175,10 +179,9 @@ class PlatformProbe:
 def _fetch_html(url: str, timeout: float = 10.0) -> str | None:
     """GET url, return response text or None. Follows redirects. Short-circuits on non-HTML."""
     try:
-        r = requests.get(
-            url, timeout=timeout, allow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; wayback-archive-bootstrap/1.0)"},
-        )
+        # Use browser-shaped UA for site probes — some stores gate API/HTML
+        # responses on non-browser clients. Our identifier is appended.
+        r = requests.get(url, timeout=timeout, allow_redirects=True, headers=BROWSER_HEADERS)
     except requests.RequestException:
         return None
     if r.status_code != 200:

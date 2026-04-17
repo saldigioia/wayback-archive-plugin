@@ -39,6 +39,7 @@ sys.path.insert(0, str(REPO_ROOT / "lib"))
 from wayback_archiver.site_config import load_config
 from wayback_archiver.checkpoint import StageCheckpoint
 from wayback_archiver.resilience import CircuitBreaker, StageTimer
+from wayback_archiver.http_client import AIOHTTP_HEADERS, USER_AGENT
 
 logging.basicConfig(
     level=logging.INFO,
@@ -215,7 +216,7 @@ async def _cc_discovery(config) -> dict:
     total_queries = 0
     total_hits = 0
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=AIOHTTP_HEADERS) as session:
         for domain in config.domains:
             log.info("  CC discovery: %s", domain)
 
@@ -669,7 +670,7 @@ async def _run_fallback_archives(
              ", ".join(fallback_archives), len(failed_targets))
 
     fetched = 0
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=AIOHTTP_HEADERS) as session:
         for i, target in enumerate(failed_targets, 1):
             content = await fallback_fetch(
                 session, target.original_url,
@@ -1015,8 +1016,8 @@ def run_download(config, dry_run=False, **_kw):
         return
 
     config.products_dir.mkdir(exist_ok=True)
-    session = requests.Session()
-    session.headers["User-Agent"] = "wayback-image-fetch/1.0 (archival research)"
+    from wayback_archiver.http_client import make_requests_session
+    session = make_requests_session()
 
     total_dl, total_fail = 0, 0
     try:
