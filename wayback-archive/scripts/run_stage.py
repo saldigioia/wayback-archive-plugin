@@ -41,6 +41,9 @@ from wayback_archiver.checkpoint import StageCheckpoint
 from wayback_archiver.resilience import CircuitBreaker, StageTimer
 from wayback_archiver.http_client import AIOHTTP_HEADERS, USER_AGENT
 from wayback_archiver import ledger as ledger_mod
+from wayback_archiver.env import load_env
+
+load_env()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1218,6 +1221,20 @@ STAGE_ORDER = [
     "match", "download", "normalize", "build",
 ]
 
+# Map audit.json residual buckets → the stage that shrinks them. Ordered so
+# that when multiple buckets are tied, we prefer the earliest-in-pipeline fix
+# (cdx_dump before fetch before download) per Protocol II (discovery before
+# extraction before asset download).
+BUCKET_TO_STAGE: list[tuple[str, str, dict]] = [
+    ("unenumerated_hosts", "cdx_dump", {}),
+    ("unresolved_slugs",   "fetch",    {}),
+    ("retry_queue_depth",  "fetch",    {"proxy_type": "dc",
+                                         "fallback_archives": ["archive_today", "memento"]}),
+    ("index_missing",      "download", {}),
+    # unexpanded_surfaces → Phase 3b (parser-level ledger writes); for now
+    # we surface the bucket but have no dedicated stage to shrink it.
+]
+
 
 def _emit_progress(progress_path: Path, stage: str, event: str, **extra) -> None:
     """Append one JSON line describing a stage transition.
@@ -1277,16 +1294,91 @@ def _run_audit(config_path: Path, progress_path: Path) -> int:
     return result.returncode
 
 
+def _pick_resume_stage(config, bucket_override: str | None = None) -> tuple[str, dict, dict]:
+    """Inspect audit.json and pick the stage that would shrink the largest bucket.
+
+    Returns (stage_name, extra_kwargs, audit_summary). Raises SystemExit if the
+    audit file is missing or all buckets are zero.
+    """
+    audit_path = config.project_path / "audit.json"
+    if not audit_path.exists():
+        log.error("No audit.json at %s — run the pipeline under --auto first.", audit_path)
+        sys.exit(2)
+    try:
+        audit = json.loads(audit_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        log.error("Cannot read audit.json: %s", e)
+        sys.exit(2)
+
+    integers = audit.get("integers", {})
+
+    if bucket_override:
+        if bucket_override not in dict((b, (s, k)) for b, s, k in BUCKET_TO_STAGE):
+            log.error("Unknown --bucket %s. Valid: %s", bucket_override,
+                      [b for b, _, _ in BUCKET_TO_STAGE])
+            sys.exit(2)
+        if integers.get(bucket_override, 0) == 0:
+            log.warning("Bucket %s is already 0 — nothing to resume.", bucket_override)
+            sys.exit(0)
+        bucket = bucket_override
+    else:
+        # Pick the largest non-zero bucket in the preference order above.
+        # Ties broken by BUCKET_TO_STAGE declaration order.
+        best_bucket = None
+        best_value = 0
+        for b, _, _ in BUCKET_TO_STAGE:
+            v = integers.get(b, 0)
+            if v > best_value:
+                best_value = v
+                best_bucket = b
+        if best_bucket is None:
+            log.info("All resumable buckets are zero. Nothing to do.")
+            sys.exit(0)
+        bucket = best_bucket
+
+    stage_name, extra_kwargs = next(
+        ((s, k) for b, s, k in BUCKET_TO_STAGE if b == bucket)
+    )
+    return stage_name, extra_kwargs, {
+        "bucket": bucket, "bucket_value": integers.get(bucket, 0),
+        "integers": integers, "audit_path": str(audit_path),
+    }
+
+
+def _run_preflight(config_path: Path, progress_path: Path) -> int:
+    """Invoke preflight.py as a subprocess. Returns exit code (0/1)."""
+    _emit_progress(progress_path, "preflight", "start")
+    t0 = time.time()
+    preflight_script = Path(__file__).resolve().parent / "preflight.py"
+    result = subprocess.run(
+        [sys.executable, str(preflight_script), "--config", str(config_path)],
+    )
+    _emit_progress(progress_path, "preflight", "end",
+                   wall_sec=round(time.time() - t0, 1),
+                   status="ok" if result.returncode == 0 else "blocking_error",
+                   exit_code=result.returncode)
+    return result.returncode
+
+
 def main():
     parser = argparse.ArgumentParser(description="Wayback Archive Pipeline")
-    parser.add_argument("stage", choices=STAGE_ORDER + ["all"])
+    parser.add_argument("stage", choices=STAGE_ORDER + ["all", "resume"],
+                        help="Stage to run. `all` runs the full pipeline; "
+                             "`resume` reads audit.json and runs the stage that "
+                             "shrinks the largest residual bucket.")
+    parser.add_argument("--bucket", default=None,
+                        choices=[b for b, _, _ in BUCKET_TO_STAGE],
+                        help="Override `resume`'s bucket selection.")
     parser.add_argument("--config", required=True, help="Path to site config YAML")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Skip confirmation prompts (for --all mode)")
     parser.add_argument("--auto", action="store_true",
                         help="Turn-key mode: implies --yes, streams compact progress "
-                             "to projects/<name>/.progress.jsonl, runs audit at end.")
+                             "to projects/<name>/.progress.jsonl, runs preflight "
+                             "before stage 0, runs audit at end.")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="Skip the pre-flight check under --auto (for CI).")
     # fetch-specific options
     parser.add_argument("--proxy", choices=["isp", "dc"], default="isp",
                         help="Proxy type for fetch stage (default: isp)")
@@ -1337,6 +1429,19 @@ def main():
         fallback_archives=fallback_archives,
     )
 
+    # `resume` reads audit.json and picks the stage that shrinks the largest
+    # residual bucket. The selected stage overrides `kwargs` with bucket-
+    # specific flags (e.g. retry_queue_depth → fetch --proxy dc --fallback).
+    if args.stage == "resume":
+        stage_name, extra_kwargs, summary = _pick_resume_stage(config, args.bucket)
+        log.info("=" * 60)
+        log.info("RESUME | bucket=%s (value=%d) → stage=%s",
+                 summary["bucket"], summary["bucket_value"], stage_name)
+        log.info("  audit: %s", summary["audit_path"])
+        log.info("=" * 60)
+        args.stage = stage_name
+        kwargs.update(extra_kwargs)
+
     if args.stage == "all":
         log.info("=" * 60)
         log.info("FULL PIPELINE | Site: %s | Dry-run: %s", config.display_name, args.dry_run)
@@ -1349,6 +1454,18 @@ def main():
         if args.auto:
             _emit_progress(progress_path, "pipeline", "start",
                            stages=STAGE_ORDER, site=config.display_name)
+
+            # Pre-flight gate (Protocol IV at the entrance). Blocking errors
+            # halt the pipeline before the first CDX dump; warnings log and
+            # continue. --skip-preflight opts out (for CI / known-good envs).
+            if not args.skip_preflight and not args.dry_run:
+                pre_exit = _run_preflight(Path(args.config), progress_path)
+                if pre_exit != 0:
+                    log.error("Pre-flight check failed (see projects/%s/preflight.json).",
+                              config.name)
+                    _emit_progress(progress_path, "pipeline", "end",
+                                   status="preflight_blocked", preflight_exit=pre_exit)
+                    sys.exit(pre_exit)
 
         pipeline_status = "aborted"  # set to "complete" only if we reach the end
         try:

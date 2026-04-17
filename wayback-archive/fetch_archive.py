@@ -58,6 +58,9 @@ if str(_HERE / "lib") not in sys.path:
 from wayback_archiver.http_client import (
     BROWSER_UA, USER_AGENT, AIOHTTP_HEADERS, parse_retry_after,
 )
+from wayback_archiver.env import load_env
+
+load_env()
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(

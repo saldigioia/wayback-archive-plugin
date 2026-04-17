@@ -39,6 +39,9 @@ sys.path.insert(0, str(REPO_ROOT / "lib"))
 
 from wayback_archiver.http_client import DEFAULT_HEADERS, BROWSER_HEADERS  # noqa: E402
 from wayback_archiver import ledger as ledger_mod  # noqa: E402
+from wayback_archiver.env import load_env  # noqa: E402
+
+load_env()
 
 TEMPLATE_DIR = REPO_ROOT / "skills" / "wayback-archive" / "configs"
 PROJECTS_DIR = REPO_ROOT / "projects"
